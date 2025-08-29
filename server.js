@@ -14,7 +14,6 @@ import os from "os";
 import axios from "axios";
 import JSZip from "jszip";
 import { PDFDocument } from "pdf-lib";
-import pdfParse from "pdf-parse";
 
 const app = express();
 
@@ -108,11 +107,16 @@ async function processPDFBasic(buf) {
   return Buffer.from(out);
 }
 
+// Lazy import de pdf-parse pour éviter les erreurs de chargement au boot
 async function extractTextFromPDF(buf) {
   try {
+    const { default: pdfParse } = await import("pdf-parse");
     const data = await pdfParse(buf);
     return cleanTextBasic(data.text || "");
-  } catch { return ""; }
+  } catch (e) {
+    console.error("PDF text extraction skipped:", e?.message || e);
+    return ""; // fallback : pas de texte = rapport LT vide côté PDF, mais le service reste stable
+  }
 }
 
 async function runLanguageTool(fullText, lang = "auto") {
