@@ -1,19 +1,19 @@
 {
-  "name": "docsafe-web-beta",
+  "name": "docsafe-backend-beta",
+  "type": "module",
   "private": true,
-  "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
-    "lint": "next lint"
-  },
+  "engines": { "node": ">=18 <22" },
+  "scripts": { "start": "node server.js" },
   "dependencies": {
-    "next": "14.2.5",
-    "react": "18.3.1",
-    "react-dom": "18.3.1",
+    "axios": "^1.7.2",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
     "jszip": "^3.10.1",
-    "lucide-react": "^0.460.0"
-  },
+    "multer": "^1.4.5-lts.1",
+    "pdf-lib": "^1.17.1",
+    "pdf-parse": "^1.1.1"
+  }
+}
   "devDependencies": {
     "typescript": "^5.4.5",
     "eslint": "^8.57.0",
