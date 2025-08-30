@@ -1,5 +1,5 @@
 /**
- * DocSafe Backend — Beta V2
+ * DocSafe Backend — Beta V2 (CORS OUVERT pour tests)
  * Endpoints:
  *  - POST /clean     -> retourne le fichier nettoyé (PDF/DOCX)
  *  - POST /clean-v2  -> nettoyé + rapport LanguageTool en ZIP (cleaned + report.json + report.html)
@@ -14,35 +14,27 @@ import os from "os";
 import axios from "axios";
 import JSZip from "jszip";
 import { PDFDocument } from "pdf-lib";
+import pdfParse from "pdf-parse";
 
 const app = express();
 
-// -------- CORS --------
-const allowed = (process.env.ALLOWED_ORIGINS || "")
-  .split(",")
-  .map(s => s.trim())
-  .filter(Boolean);
-app.use(cors({
-  origin(origin, cb) {
-    if (!origin) return cb(null, true);
-    if (allowed.length === 0 || allowed.includes(origin)) return cb(null, true);
-    return cb(new Error("Origin not allowed by CORS"));
-  },
-  credentials: true
-}));
+/* ---------------- CORS (ouvert pour valider rapidement) ---------------- */
+app.use(cors({ origin: true, credentials: true }));
+app.options("*", cors());
 
 app.use(express.json({ limit: "25mb" }));
 
-// -------- Upload --------
+/* ---------------- Upload ---------------- */
 const upload = multer({
   storage: multer.diskStorage({
     destination: (req, file, cb) => cb(null, os.tmpdir()),
-    filename: (req, file, cb) => cb(null, Date.now() + "-" + file.originalname.replace(/\s+/g, "_"))
+    filename: (req, file, cb) =>
+      cb(null, Date.now() + "-" + file.originalname.replace(/\s+/g, "_")),
   }),
-  limits: { fileSize: 20 * 1024 * 1024 } // 20 Mo
+  limits: { fileSize: 20 * 1024 * 1024 }, // 20 Mo
 });
 
-// -------- Helpers --------
+/* ---------------- Helpers ---------------- */
 const LT_URL = process.env.LT_API_URL || "https://api.languagetool.org/v2/check";
 const LT_KEY = process.env.LT_API_KEY || null;
 
@@ -93,7 +85,10 @@ async function extractTextFromDOCX(buf) {
   if (!zip.file(p)) return "";
   const xml = await zip.file(p).async("string");
   let t = "";
-  xml.replace(/<w:t[^>]*>([\s\S]*?)<\/w:t>/g, (_m, inner) => { t += inner + " "; return _m; });
+  xml.replace(/<w:t[^>]*>([\s\S]*?)<\/w:t>/g, (_m, inner) => {
+    t += inner + " ";
+    return _m;
+  });
   return cleanTextBasic(t);
 }
 
@@ -107,15 +102,12 @@ async function processPDFBasic(buf) {
   return Buffer.from(out);
 }
 
-// Lazy import de pdf-parse pour éviter les erreurs de chargement au boot
 async function extractTextFromPDF(buf) {
   try {
-    const { default: pdfParse } = await import("pdf-parse");
     const data = await pdfParse(buf);
     return cleanTextBasic(data.text || "");
-  } catch (e) {
-    console.error("PDF text extraction skipped:", e?.message || e);
-    return ""; // fallback : pas de texte = rapport LT vide côté PDF, mais le service reste stable
+  } catch {
+    return "";
   }
 }
 
@@ -130,7 +122,8 @@ async function runLanguageTool(fullText, lang = "auto") {
     form.set("language", lang);
     if (LT_KEY) form.set("apiKey", LT_KEY);
     const r = await axios.post(LT_URL, form.toString(), {
-      headers: { "Content-Type": "application/x-www-form-urlencoded" }, timeout: 30000
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      timeout: 30000,
     });
     if (r?.data?.matches?.length) matches = matches.concat(r.data.matches);
   }
@@ -148,17 +141,19 @@ function buildReportJSON({ fileName, language, matches, textLength }) {
 
 function buildReportHTML(report) {
   const { summary, matches } = report;
-  const rows = matches.map((m, i) => {
-    const repl = (m.replacements || []).slice(0, 3).map(r => r.value).join(", ");
-    const ctx = (m.context?.text || "").replace(/</g, "&lt;");
-    return `<tr>
+  const rows = matches
+    .map((m, i) => {
+      const repl = (m.replacements || []).slice(0, 3).map((r) => r.value).join(", ");
+      const ctx = (m.context?.text || "").replace(/</g, "&lt;");
+      return `<tr>
       <td style="padding:8px;border-bottom:1px solid #e5e7eb;">${i + 1}</td>
       <td style="padding:8px;border-bottom:1px solid #e5e7eb;">${m.rule?.id || ""}</td>
       <td style="padding:8px;border-bottom:1px solid #e5e7eb;">${(m.message || "").replace(/</g,"&lt;")}</td>
       <td style="padding:8px;border-bottom:1px solid #e5e7eb;">${repl || "-"}</td>
       <td style="padding:8px;border-bottom:1px solid #e5e7eb;">${ctx}</td>
     </tr>`;
-  }).join("");
+    })
+    .join("");
   return `<!doctype html><html><head><meta charset="utf-8"><title>DocSafe Report</title>
   <meta name="viewport" content="width=device-width,initial-scale=1"><style>
   body{font-family:system-ui,Segoe UI,Roboto,Ubuntu,sans-serif;background:#0f172a;color:#e5e7eb;margin:0;padding:24px}
@@ -180,7 +175,7 @@ function buildReportHTML(report) {
   </table></div></div></body></html>`;
 }
 
-// -------- Routes --------
+/* ---------------- Routes ---------------- */
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.post("/clean", upload.single("file"), async (req, res) => {
@@ -231,7 +226,9 @@ app.post("/clean-v2", upload.single("file"), async (req, res) => {
     }
 
     const matches = await runLanguageTool(text || "", lang);
-    const reportJSON = buildReportJSON({ fileName: cleanedName, language: lang, matches, textLength: (text || "").length });
+    const reportJSON = buildReportJSON({
+      fileName: cleanedName, language: lang, matches, textLength: (text || "").length,
+    });
     const reportHTML = buildReportHTML(reportJSON);
 
     const zip = new JSZip();
