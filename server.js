@@ -1,5 +1,5 @@
 /**
- * DocSafe Backend — Beta V2 (CORS OUVERT pour tests)
+ * DocSafe Backend — Beta V2 (CORS OUVERT pour tests, sans pdf-parse)
  * Endpoints:
  *  - POST /clean     -> retourne le fichier nettoyé (PDF/DOCX)
  *  - POST /clean-v2  -> nettoyé + rapport LanguageTool en ZIP (cleaned + report.json + report.html)
@@ -14,7 +14,6 @@ import os from "os";
 import axios from "axios";
 import JSZip from "jszip";
 import { PDFDocument } from "pdf-lib";
-import pdfParse from "pdf-parse";
 
 const app = express();
 
@@ -102,13 +101,9 @@ async function processPDFBasic(buf) {
   return Buffer.from(out);
 }
 
-async function extractTextFromPDF(buf) {
-  try {
-    const data = await pdfParse(buf);
-    return cleanTextBasic(data.text || "");
-  } catch {
-    return "";
-  }
+/* IMPORTANT : on ne lit plus le texte PDF (pas de pdf-parse en prod bêta) */
+async function extractTextFromPDF(_buf) {
+  return ""; // V2 sur PDF => rapport vide, mais cleaning OK
 }
 
 async function runLanguageTool(fullText, lang = "auto") {
@@ -215,7 +210,7 @@ app.post("/clean-v2", upload.single("file"), async (req, res) => {
       const buf = await fsp.readFile(p);
       cleanedBuf = await processPDFBasic(buf);
       cleanedName = req.file.originalname.replace(/\.pdf$/i, "") + "_cleaned.pdf";
-      text = await extractTextFromPDF(cleanedBuf);
+      text = await extractTextFromPDF(cleanedBuf); // retournera ""
     } else if (name.endsWith(".docx")) {
       const buf = await fsp.readFile(p);
       cleanedBuf = await processDOCXBasic(buf);
