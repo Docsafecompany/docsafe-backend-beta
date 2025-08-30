@@ -3,9 +3,7 @@
   "type": "module",
   "private": true,
   "engines": { "node": ">=18 <22" },
-  "scripts": {
-    "start": "node server.js"
-  },
+  "scripts": { "start": "node server.js" },
   "dependencies": {
     "axios": "^1.7.2",
     "cors": "^2.8.5",
