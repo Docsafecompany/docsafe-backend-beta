@@ -1,12 +1,11 @@
 /**
- * DocSafe Backend — Beta V2 (PDF/DOCX/PPTX + LanguageTool)
+ * DocSafe Backend — Beta V2
  * Endpoints:
- *  - POST /clean       -> retourne le fichier nettoyé (PDF/DOCX/PPTX)
- *  - POST /clean-v2    -> nettoyé + rapport LanguageTool en ZIP (cleaned + report.json + report.html)
- *  - GET  /health      -> OK
+ *  - POST /clean     -> retourne le fichier nettoyé (PDF/DOCX/PPTX)
+ *  - POST /clean-v2  -> nettoyé + rapport LanguageTool en ZIP (cleaned + report.json + report.html)
+ *  - GET  /health    -> OK
  *
- * Notes:
- *  - Option strict (PDF) : ajouter ?strict=1 pour tenter de retirer le texte blanc/invisible.
+ * Option: /clean?strict=1 (PDF) -> tentative de retrait de texte blanc/invisible
  */
 import express from "express";
 import cors from "cors";
@@ -19,11 +18,11 @@ import JSZip from "jszip";
 import { PDFDocument, PDFName } from "pdf-lib";
 import zlib from "zlib";
 
-let pdfParse = null; // lazy import pour éviter certains bugs de charge
+let pdfParse = null; // lazy import pour éviter les soucis d'init
 
 const app = express();
 
-// -------- CORS --------
+/* ---------------- CORS ---------------- */
 const allowed = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map(s => s.trim())
@@ -40,7 +39,7 @@ app.use(cors({
 
 app.use(express.json({ limit: "25mb" }));
 
-// -------- Upload --------
+/* --------------- Upload --------------- */
 const upload = multer({
   storage: multer.diskStorage({
     destination: (req, file, cb) => cb(null, os.tmpdir()),
@@ -49,25 +48,25 @@ const upload = multer({
   limits: { fileSize: 20 * 1024 * 1024 } // 20 Mo
 });
 
-// -------- Helpers --------
+/* -------------- Helpers --------------- */
 const LT_URL = process.env.LT_API_URL || "https://api.languagetool.org/v2/check";
 const LT_KEY = process.env.LT_API_KEY || null;
 
 function cleanTextBasic(str) {
   if (!str) return str;
   return String(str)
-    .replace(/\u200B/g, "")
-    .replace(/[ \t]+/g, " ")
+    .replace(/\u200B/g, "")           // zero-width space
+    .replace(/[ \t]+/g, " ")          // espaces multiples
     .replace(/ *\n */g, "\n")
-    .replace(/ ?([,;:!?]) ?/g, "$1 ")
+    .replace(/ ?([,;:!?]) ?/g, "$1 ") // ponctuation collée
     .replace(/ \./g, ".")
     .replace(/[ ]{2,}/g, " ")
-    .replace(/,,+/g, ",")
+    .replace(/,,+/g, ",")             // doubles virgules
     .replace(/;;+/g, ";")
     .trim();
 }
 
-// ----- DOCX -----
+/* -------------- DOCX ------------------ */
 async function processDOCXBasic(buf) {
   const zip = await JSZip.loadAsync(buf);
   const core = "docProps/core.xml";
@@ -102,10 +101,9 @@ async function extractTextFromDOCX(buf) {
   return cleanTextBasic(t);
 }
 
-// ----- PPTX -----
+/* -------------- PPTX ------------------ */
 async function processPPTXBasic(buf) {
   const zip = await JSZip.loadAsync(buf);
-
   const core = "docProps/core.xml";
   if (zip.file(core)) {
     let xml = await zip.file(core).async("string");
@@ -119,21 +117,19 @@ async function processPPTXBasic(buf) {
   }
   if (zip.file("docProps/custom.xml")) zip.remove("docProps/custom.xml");
 
-  // Nettoyage texte dans les slides
-  const slideFiles = Object.keys(zip.files).filter((p) => /^ppt\/slides\/slide\d+\.xml$/i.test(p));
+  const slideFiles = Object.keys(zip.files).filter(p => /^ppt\/slides\/slide\d+\.xml$/i.test(p));
   for (const p of slideFiles) {
     let xml = await zip.file(p).async("string");
     xml = xml.replace(/<a:t[^>]*>([\s\S]*?)<\/a:t>/g, (m, inner) => m.replace(inner, cleanTextBasic(inner)));
     zip.file(p, xml);
   }
-
   return await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
 }
 
 async function extractTextFromPPTX(buf) {
   const zip = await JSZip.loadAsync(buf);
   let out = "";
-  const slideFiles = Object.keys(zip.files).filter((p) => /^ppt\/slides\/slide\d+\.xml$/i.test(p));
+  const slideFiles = Object.keys(zip.files).filter(p => /^ppt\/slides\/slide\d+\.xml$/i.test(p));
   for (const p of slideFiles) {
     const xml = await zip.file(p).async("string");
     xml.replace(/<a:t[^>]*>([\s\S]*?)<\/a:t>/g, (_m, inner) => { out += inner + " "; return _m; });
@@ -141,24 +137,20 @@ async function extractTextFromPPTX(buf) {
   return cleanTextBasic(out);
 }
 
-// ----- PDF -----
+/* --------------- PDF ------------------ */
 async function processPDFBasic(buf, { strict = false } = {}) {
   const pdf = await PDFDocument.load(buf, { updateMetadata: true });
-  // Scrub info dictionary
+
+  // Vider les métadonnées usuelles
   pdf.setTitle(""); pdf.setAuthor(""); pdf.setSubject("");
   pdf.setKeywords([]); pdf.setProducer(""); pdf.setCreator("");
   const epoch = new Date(0);
   pdf.setCreationDate(epoch); pdf.setModificationDate(epoch);
 
-  // Tentative de suppression de la référence /Metadata dans le Catalog si présente
-  try {
-    const catalog = pdf.catalog;
-    if (catalog?.dict) {
-      catalog.dict.delete(PDFName.of("Metadata"));
-    }
-  } catch {}
+  // Retirer le flux XMP /Metadata du Catalog (si présent)
+  try { pdf.catalog?.dict?.delete(PDFName.of("Metadata")); } catch {}
 
-  // Tentative de suppression d'AcroForm/JavaScript
+  // Retirer éléments potentiellement sensibles
   try {
     const dict = pdf.catalog?.dict;
     if (dict) {
@@ -169,114 +161,85 @@ async function processPDFBasic(buf, { strict = false } = {}) {
     }
   } catch {}
 
-  let out = await pdf.save({ useObjectStreams: false });
-  let outBuf = Buffer.from(out);
+  let outBuf = Buffer.from(await pdf.save({ useObjectStreams: false }));
 
-  if (strict) {
-    // Heuristique: parcourir les objets stream (FlateDecode ou texte brut) et supprimer
-    // les instructions Tj/TJ lorsqu'elles sont précédées de "3 Tr" (invisible) ou "1 1 1 rg" (blanc).
-    outBuf = tryStripHiddenText(outBuf);
-  }
+  // Mode strict: tentative de suppression de texte invisible/blanc dans les streams
+  if (strict) outBuf = tryStripHiddenText(outBuf);
+
   return outBuf;
 }
 
+// Heuristique: supprime Tj/TJ quand précédés de "3 Tr" (invisible) ou "1 1 1 rg" (blanc)
 function tryStripHiddenText(pdfBuf) {
   const src = pdfBuf.toString("binary");
-
-  // Découpe grossière par objets stream
   const parts = [];
   let idx = 0;
+
   while (true) {
     const sIdx = src.indexOf("stream", idx);
     if (sIdx === -1) { parts.push([idx, src.length, null]); break; }
     const eLine = src.indexOf("\n", sIdx);
     const eCR = src.indexOf("\r\n", sIdx);
     const eol = (eCR !== -1 && (eLine === -1 || eCR < eLine)) ? eCR + 2 : eLine + 1;
-
     const endIdx = src.indexOf("endstream", eol);
     if (endIdx === -1) { parts.push([idx, src.length, null]); break; }
-
-    parts.push([idx, sIdx, null]); // header part
-    parts.push([eol, endIdx, "stream"]); // actual stream data
+    parts.push([idx, sIdx, null]);       // header
+    parts.push([eol, endIdx, "stream"]); // data
     idx = endIdx;
   }
 
   let rebuilt = "";
-  for (let i = 0; i < parts.length; i++) {
-    const [a, b, kind] = parts[i];
+  for (const [a, b, kind] of parts) {
     const chunk = src.slice(a, b);
-    if (kind !== "stream") {
-      rebuilt += chunk;
-      continue;
-    }
+    if (kind !== "stream") { rebuilt += chunk; continue; }
 
-    // Tente de décompresser (Flate)
     let data = chunk;
-    try {
-      const buf = Buffer.from(chunk, "binary");
-      const inflated = zlib.inflateSync(buf);
-      data = inflated.toString("binary");
-    } catch {
-      // peut déjà être non compressé, on garde data tel quel
-    }
+    let inflated = null;
+    try { inflated = zlib.inflateSync(Buffer.from(chunk, "binary")); data = inflated.toString("binary"); } catch {}
 
-    // Suppression d'opérations texte invisibles/blanches (heuristique best-effort)
     const cleaned = stripOpsInStream(data);
 
-    // Recompresse si on avait réussi à inflater
     let out;
     try {
-      if (cleaned !== data) {
+      if (inflated && cleaned !== data) {
         const deflated = zlib.deflateSync(Buffer.from(cleaned, "binary"));
         out = deflated.toString("binary");
       } else {
-        out = chunk;
+        out = inflated ? data : cleaned;
       }
-    } catch {
-      out = cleaned;
-    }
+    } catch { out = cleaned; }
+
     rebuilt += out;
   }
 
   return Buffer.from(rebuilt, "binary");
 }
 
-// Supprime les Tj/TJ lorsque précédées de "3 Tr" (texte invisible) ou "1 1 1 rg" (blanc)
 function stripOpsInStream(data) {
-  // Simplifie les EOL pour la détection
   let s = data.replace(/\r\n/g, "\n");
-
-  // 1) Invisible text: "3 Tr" => supprime les Tj/TJ sur la même ligne
-  s = s.replace(/(?:^|\n)([^]*?)\b3\s+Tr[^\n]*\n/g, (line) => {
-    // retire Tj/TJ dans cette ligne
-    return line.replace(/\((?:\\.|[^\\)])*\)\s*T[Jj]/g, "");
-  });
-
-  // 2) White text: "1 1 1 rg" => supprime Tj/TJ sur la même ligne
-  s = s.replace(/(?:^|\n)([^]*?)\b1(?:\.0+)?\s+1(?:\.0+)?\s+1(?:\.0+)?\s+rg[^\n]*\n/g, (line) => {
-    return line.replace(/\((?:\\.|[^\\)])*\)\s*T[Jj]/g, "");
-  });
-
-  // Nettoyage: espaces multiples devenus inutiles
-  s = s.replace(/[ ]{2,}/g, " ");
-  return s;
+  // Invisible (3 Tr)
+  s = s.replace(/(?:^|\n)([^]*?)\b3\s+Tr[^\n]*\n/g, line =>
+    line.replace(/\((?:\\.|[^\\)])*\)\s*T[Jj]/g, "")
+  );
+  // Blanc (1 1 1 rg)
+  s = s.replace(/(?:^|\n)([^]*?)\b1(?:\.0+)?\s+1(?:\.0+)?\s+1(?:\.0+)?\s+rg[^\n]*\n/g, line =>
+    line.replace(/\((?:\\.|[^\\)])*\)\s*T[Jj]/g, "")
+  );
+  return s.replace(/[ ]{2,}/g, " ");
 }
 
 async function extractTextFromPDF(buf) {
   try {
     if (!pdfParse) {
-      // lazy import pour éviter bug au lancement dans certains environnements
       const mod = await import("pdf-parse");
       pdfParse = mod.default || mod;
     }
     const data = await pdfParse(buf);
     return cleanTextBasic(data.text || "");
-  } catch {
-    return "";
-  }
+  } catch { return ""; }
 }
 
-// ----- LanguageTool -----
+/* --------- LanguageTool ---------- */
 async function runLanguageTool(fullText, lang = "auto") {
   const chunks = [];
   for (let i = 0; i < fullText.length; i += 20000) chunks.push(fullText.slice(i, i + 20000));
@@ -338,7 +301,7 @@ function buildReportHTML(report) {
   </table></div></div></body></html>`;
 }
 
-// -------- Routes --------
+/* --------------- Routes --------------- */
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.post("/clean", upload.single("file"), async (req, res) => {
@@ -423,4 +386,3 @@ app.post("/clean-v2", upload.single("file"), async (req, res) => {
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log("DocSafe backend running on port", PORT));
-
