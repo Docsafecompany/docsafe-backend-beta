@@ -1,16 +1,12 @@
 /**
- * DocSafe Backend — Beta V2 (Cleaner amélioré)
- *
- * Nouveautés:
- * - cleanTextBasic: supprime doublons de ponctuation (",,", ";;", "!!", "??", "..."), espaces superflus.
- * - PDF V1: purge métadonnées (Info + dates), enlève JS/Annots/Attachments/AcroForm/OpenAction (durcit la surface d'attaque).
- * - Mode strict PDF (optionnel): tentative de retrait de texte blanc/invisible dans les flux (regex best-effort).
- *   Activez-le avec:  1) env PDF_STRICT=1  OU  2) query ?strict=1 sur /clean (PDF uniquement)
- *
+ * DocSafe Backend — Beta V2 (PDF/DOCX/PPTX + LanguageTool)
  * Endpoints:
- *  - POST /clean     -> PDF/DOCX nettoyé
- *  - POST /clean-v2  -> nettoyé + rapport LanguageTool (ZIP: cleaned + report.json + report.html)
- *  - GET  /health    -> OK
+ *  - POST /clean       -> retourne le fichier nettoyé (PDF/DOCX/PPTX)
+ *  - POST /clean-v2    -> nettoyé + rapport LanguageTool en ZIP (cleaned + report.json + report.html)
+ *  - GET  /health      -> OK
+ *
+ * Notes:
+ *  - Option strict (PDF) : ajouter ?strict=1 pour tenter de retirer le texte blanc/invisible.
  */
 import express from "express";
 import cors from "cors";
@@ -20,56 +16,60 @@ import fsp from "fs/promises";
 import os from "os";
 import axios from "axios";
 import JSZip from "jszip";
-import { PDFDocument } from "pdf-lib";
-import pako from "pako";
+import { PDFDocument, PDFName } from "pdf-lib";
+import zlib from "zlib";
+
+let pdfParse = null; // lazy import pour éviter certains bugs de charge
 
 const app = express();
 
-/* ---------------- CORS (ouvert pour valider rapidement) ---------------- */
-app.use(cors({ origin: true, credentials: true }));
-app.options("*", cors());
+// -------- CORS --------
+const allowed = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  origin(origin, cb) {
+    if (!origin) return cb(null, true);
+    if (allowed.length === 0 || allowed.includes(origin)) return cb(null, true);
+    return cb(new Error("Origin not allowed by CORS"));
+  },
+  credentials: true
+}));
 
 app.use(express.json({ limit: "25mb" }));
 
-/* ---------------- Upload ---------------- */
+// -------- Upload --------
 const upload = multer({
   storage: multer.diskStorage({
     destination: (req, file, cb) => cb(null, os.tmpdir()),
-    filename: (req, file, cb) =>
-      cb(null, Date.now() + "-" + file.originalname.replace(/\s+/g, "_")),
+    filename: (req, file, cb) => cb(null, Date.now() + "-" + file.originalname.replace(/\s+/g, "_"))
   }),
-  limits: { fileSize: 20 * 1024 * 1024 }, // 20 Mo
+  limits: { fileSize: 20 * 1024 * 1024 } // 20 Mo
 });
 
-/* ---------------- Helpers ---------------- */
+// -------- Helpers --------
 const LT_URL = process.env.LT_API_URL || "https://api.languagetool.org/v2/check";
 const LT_KEY = process.env.LT_API_KEY || null;
 
 function cleanTextBasic(str) {
   if (!str) return str;
-  let s = String(str);
-
-  // Normalisations simples
-  s = s.replace(/\u200B/g, "");                   // zero-width space
-  s = s.replace(/[ \t]+/g, " ");                  // espaces multiples
-  s = s.replace(/ *\n */g, "\n");                 // espaces autour des retours à la ligne
-
-  // Ponctuation: collapse doublons
-  s = s.replace(/([,;:!?])\1+/g, "$1");           // ",,", "!!", "??", ";;", "::"
-  s = s.replace(/\.{3,}/g, "...");                // "....." -> "..."
-  // Espaces autour de la ponctuation
-  s = s.replace(/ ?([,;:!?]) ?/g, "$1 ");         // " , " -> ", "
-  s = s.replace(/ \./g, ".");                     // " ." -> "."
-  s = s.replace(/[ ]{2,}/g, " ");                 // espaces doublons
-
-  // Exemple FR: espace fines avant ;:!? non gérées ici -> on uniformise simple
-  return s.trim();
+  return String(str)
+    .replace(/\u200B/g, "")
+    .replace(/[ \t]+/g, " ")
+    .replace(/ *\n */g, "\n")
+    .replace(/ ?([,;:!?]) ?/g, "$1 ")
+    .replace(/ \./g, ".")
+    .replace(/[ ]{2,}/g, " ")
+    .replace(/,,+/g, ",")
+    .replace(/;;+/g, ";")
+    .trim();
 }
 
-/* ---------------- DOCX ---------------- */
+// ----- DOCX -----
 async function processDOCXBasic(buf) {
   const zip = await JSZip.loadAsync(buf);
-  // Métadonnées
   const core = "docProps/core.xml";
   if (zip.file(core)) {
     let xml = await zip.file(core).async("string");
@@ -83,14 +83,10 @@ async function processDOCXBasic(buf) {
   }
   if (zip.file("docProps/custom.xml")) zip.remove("docProps/custom.xml");
 
-  // Nettoyage du texte
   const docXml = "word/document.xml";
   if (zip.file(docXml)) {
     let xml = await zip.file(docXml).async("string");
-    xml = xml.replace(/<w:t[^>]*>([\s\S]*?)<\/w:t>/g, (m, inner) => {
-      const cleaned = cleanTextBasic(inner);
-      return m.replace(inner, cleaned);
-    });
+    xml = xml.replace(/<w:t[^>]*>([\s\S]*?)<\/w:t>/g, (m, inner) => m.replace(inner, cleanTextBasic(inner)));
     zip.file(docXml, xml);
   }
   return await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
@@ -106,141 +102,181 @@ async function extractTextFromDOCX(buf) {
   return cleanTextBasic(t);
 }
 
-/* ---------------- PDF ---------------- */
-function _nukeCommonCatalogKeys(pdf) {
-  try {
-    const dict = pdf?.catalog?.dict;
-    if (!dict) return;
+// ----- PPTX -----
+async function processPPTXBasic(buf) {
+  const zip = await JSZip.loadAsync(buf);
 
-    // Supprimer clés qui exposent des actions/JS/attachements/formulaires
-    const kill = [
-      "OpenAction", "AA", "AcroForm", "Lang", "Names", "Outlines",
-      "PageMode", "ViewerPreferences", "URI", "JavaScript", "JS",
-      "Collection", "Metadata" // XMP metadata
-    ];
-    // suppression souple (sans PDFName)
-    for (const k of Array.from(dict.keys?.() || [])) {
-      const keyStr = k?.toString?.() || "";
-      if (kill.some(tag => keyStr.includes(`/${tag}`))) {
-        dict.delete(k);
-      }
-    }
-  } catch {}
+  const core = "docProps/core.xml";
+  if (zip.file(core)) {
+    let xml = await zip.file(core).async("string");
+    xml = xml
+      .replace(/<dc:creator>.*?<\/dc:creator>/s, "<dc:creator></dc:creator>")
+      .replace(/<cp:lastModifiedBy>.*?<\/cp:lastModifiedBy>/s, "<cp:lastModifiedBy></cp:lastModifiedBy>")
+      .replace(/<dc:title>.*?<\/dc:title>/s, "<dc:title></dc:title>")
+      .replace(/<dc:subject>.*?<\/dc:subject>/s, "<dc:subject></dc:subject>")
+      .replace(/<cp:keywords>.*?<\/cp:keywords>/s, "<cp:keywords></cp:keywords>");
+    zip.file(core, xml);
+  }
+  if (zip.file("docProps/custom.xml")) zip.remove("docProps/custom.xml");
+
+  // Nettoyage texte dans les slides
+  const slideFiles = Object.keys(zip.files).filter((p) => /^ppt\/slides\/slide\d+\.xml$/i.test(p));
+  for (const p of slideFiles) {
+    let xml = await zip.file(p).async("string");
+    xml = xml.replace(/<a:t[^>]*>([\s\S]*?)<\/a:t>/g, (m, inner) => m.replace(inner, cleanTextBasic(inner)));
+    zip.file(p, xml);
+  }
+
+  return await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
 }
 
-function _stripAnnotsAndActions(pdf) {
-  try {
-    for (const page of pdf.getPages()) {
-      // Enlever annotations (liens, commentaires, etc.)
-      // Accès souple au dictionnaire interne (pas d'API publique stricte)
-      const node = page.node;
-      const keys = Array.from(node.dict?.keys?.() || []);
-      for (const k of keys) {
-        const ks = k?.toString?.() || "";
-        if (ks.includes("/Annots")) node.dict.delete(k);
-        if (ks.includes("/AA")) node.dict.delete(k);          // actions supplémentaires
-      }
-    }
-  } catch {}
+async function extractTextFromPPTX(buf) {
+  const zip = await JSZip.loadAsync(buf);
+  let out = "";
+  const slideFiles = Object.keys(zip.files).filter((p) => /^ppt\/slides\/slide\d+\.xml$/i.test(p));
+  for (const p of slideFiles) {
+    const xml = await zip.file(p).async("string");
+    xml.replace(/<a:t[^>]*>([\s\S]*?)<\/a:t>/g, (_m, inner) => { out += inner + " "; return _m; });
+  }
+  return cleanTextBasic(out);
 }
 
-// Best-effort: supprime texte blanc/invisible de certains flux
-function _tryStripWhiteOrInvisible(streamBytes) {
-  // Détection/édition via regex sur contenu texte (si FlateDecode -> décodé avant)
-  const str = new TextDecoder("latin1").decode(streamBytes);
-
-  // Retire séquences: "1 1 1 rg ... (text) Tj" ou "[...] TJ"
-  const rgWhite = /(?:^|\s)(?:1(?:\.0+)?\s+){2}1(?:\.0+)?\s+rg[\s\S]{0,400}?(?:\([^\)]*\)\s*Tj|\[[^\]]*\]\s*TJ)/g;
-  // Retire texte en mode rendu invisible "3 Tr ... (text) Tj/TJ"
-  const trInvisible = /(?:^|\s)3\s+Tr[\s\S]{0,400}?(?:\([^\)]*\)\s*Tj|\[[^\]]*\]\s*TJ)/g;
-
-  let out = str.replace(rgWhite, "");
-  out = out.replace(trInvisible, "");
-
-  return new TextEncoder().encode(out);
-}
-
+// ----- PDF -----
 async function processPDFBasic(buf, { strict = false } = {}) {
   const pdf = await PDFDocument.load(buf, { updateMetadata: true });
-
-  // 1) Métadonnées "Info"
+  // Scrub info dictionary
   pdf.setTitle(""); pdf.setAuthor(""); pdf.setSubject("");
   pdf.setKeywords([]); pdf.setProducer(""); pdf.setCreator("");
   const epoch = new Date(0);
   pdf.setCreationDate(epoch); pdf.setModificationDate(epoch);
 
-  // 2) Purge durcie du catalogue (XMP metadata, JS, actions, attachements, formulaires…)
-  _nukeCommonCatalogKeys(pdf);
-
-  // 3) Pages: enlever annotations & actions
-  _stripAnnotsAndActions(pdf);
-
-  // 4) (Optionnel) STRIP flux "texte blanc / invisible"
-  if (strict) {
-    try {
-      const context = pdf.context;
-      for (const page of pdf.getPages()) {
-        // Récupère la réf "Contents" (un stream ou un array de streams)
-        const node = page.node;
-        const contentsRef = node.dict.get?.(Object.fromEntries([])); // placeholder to keep TS calm
-        // Accès plus permissif:
-        const dict = node.dict;
-        const contentsKey = Array.from(dict.keys?.() || []).find(k => (k?.toString?.() || "").includes("/Contents"));
-        if (!contentsKey) continue;
-        const raw = dict.get(contentsKey);
-
-        const asArray = Array.isArray(raw?.array) ? raw.array : (raw ? [raw] : []);
-        const newStreams = [];
-
-        for (const ref of asArray) {
-          const stream = context.lookup(ref); // PDFRawStream or similar
-          if (!stream) continue;
-          let bytes = stream.contents || stream.getContents?.();
-          if (!bytes) continue;
-
-          // Décode si FlateDecode
-          const dictS = stream.dict;
-          const keys = Array.from(dictS.keys?.() || []);
-          const hasFlate = keys.some(k => (k?.toString?.() || "").includes("/Filter")) &&
-            String(dictS.get?.(keys.find(k => (k?.toString?.() || "").includes("/Filter")))).includes("Flate");
-
-          let decoded = bytes;
-          if (hasFlate) {
-            try { decoded = pako.inflate(bytes); } catch {}
-          }
-
-          // STRIP
-          const cleaned = _tryStripWhiteOrInvisible(decoded);
-
-          // Re-encode si nécessaire
-          let finalBytes = cleaned;
-          if (hasFlate) {
-            try { finalBytes = pako.deflate(cleaned); } catch {}
-          }
-
-          // Remplace le contenu et met à jour /Length
-          stream.contents = finalBytes;
-          const lenKey = Array.from(dictS.keys?.() || []).find(k => (k?.toString?.() || "").includes("/Length"));
-          if (lenKey) dictS.set?.(lenKey, context.obj(finalBytes.length));
-          newStreams.push(stream);
-        }
-      }
-    } catch {
-      // en cas d'échec silencieux, on laisse le PDF tel quel (au pire: seules les métadonnées/annots/JS sont purgées)
+  // Tentative de suppression de la référence /Metadata dans le Catalog si présente
+  try {
+    const catalog = pdf.catalog;
+    if (catalog?.dict) {
+      catalog.dict.delete(PDFName.of("Metadata"));
     }
+  } catch {}
+
+  // Tentative de suppression d'AcroForm/JavaScript
+  try {
+    const dict = pdf.catalog?.dict;
+    if (dict) {
+      dict.delete(PDFName.of("Names"));
+      dict.delete(PDFName.of("OpenAction"));
+      dict.delete(PDFName.of("AcroForm"));
+      dict.delete(PDFName.of("AA"));
+    }
+  } catch {}
+
+  let out = await pdf.save({ useObjectStreams: false });
+  let outBuf = Buffer.from(out);
+
+  if (strict) {
+    // Heuristique: parcourir les objets stream (FlateDecode ou texte brut) et supprimer
+    // les instructions Tj/TJ lorsqu'elles sont précédées de "3 Tr" (invisible) ou "1 1 1 rg" (blanc).
+    outBuf = tryStripHiddenText(outBuf);
+  }
+  return outBuf;
+}
+
+function tryStripHiddenText(pdfBuf) {
+  const src = pdfBuf.toString("binary");
+
+  // Découpe grossière par objets stream
+  const parts = [];
+  let idx = 0;
+  while (true) {
+    const sIdx = src.indexOf("stream", idx);
+    if (sIdx === -1) { parts.push([idx, src.length, null]); break; }
+    const eLine = src.indexOf("\n", sIdx);
+    const eCR = src.indexOf("\r\n", sIdx);
+    const eol = (eCR !== -1 && (eLine === -1 || eCR < eLine)) ? eCR + 2 : eLine + 1;
+
+    const endIdx = src.indexOf("endstream", eol);
+    if (endIdx === -1) { parts.push([idx, src.length, null]); break; }
+
+    parts.push([idx, sIdx, null]); // header part
+    parts.push([eol, endIdx, "stream"]); // actual stream data
+    idx = endIdx;
   }
 
-  const out = await pdf.save({ useObjectStreams: false });
-  return Buffer.from(out);
+  let rebuilt = "";
+  for (let i = 0; i < parts.length; i++) {
+    const [a, b, kind] = parts[i];
+    const chunk = src.slice(a, b);
+    if (kind !== "stream") {
+      rebuilt += chunk;
+      continue;
+    }
+
+    // Tente de décompresser (Flate)
+    let data = chunk;
+    try {
+      const buf = Buffer.from(chunk, "binary");
+      const inflated = zlib.inflateSync(buf);
+      data = inflated.toString("binary");
+    } catch {
+      // peut déjà être non compressé, on garde data tel quel
+    }
+
+    // Suppression d'opérations texte invisibles/blanches (heuristique best-effort)
+    const cleaned = stripOpsInStream(data);
+
+    // Recompresse si on avait réussi à inflater
+    let out;
+    try {
+      if (cleaned !== data) {
+        const deflated = zlib.deflateSync(Buffer.from(cleaned, "binary"));
+        out = deflated.toString("binary");
+      } else {
+        out = chunk;
+      }
+    } catch {
+      out = cleaned;
+    }
+    rebuilt += out;
+  }
+
+  return Buffer.from(rebuilt, "binary");
 }
 
-/* ---------------- LT ---------------- */
-async function extractTextFromPDF(_buf) {
-  // Dans cette bêta, on ne lit pas le texte PDF (pour éviter les crashs sur certains fichiers).
-  // => Rapport LT vide pour PDF, mais cleaning OK.
-  return "";
+// Supprime les Tj/TJ lorsque précédées de "3 Tr" (texte invisible) ou "1 1 1 rg" (blanc)
+function stripOpsInStream(data) {
+  // Simplifie les EOL pour la détection
+  let s = data.replace(/\r\n/g, "\n");
+
+  // 1) Invisible text: "3 Tr" => supprime les Tj/TJ sur la même ligne
+  s = s.replace(/(?:^|\n)([^]*?)\b3\s+Tr[^\n]*\n/g, (line) => {
+    // retire Tj/TJ dans cette ligne
+    return line.replace(/\((?:\\.|[^\\)])*\)\s*T[Jj]/g, "");
+  });
+
+  // 2) White text: "1 1 1 rg" => supprime Tj/TJ sur la même ligne
+  s = s.replace(/(?:^|\n)([^]*?)\b1(?:\.0+)?\s+1(?:\.0+)?\s+1(?:\.0+)?\s+rg[^\n]*\n/g, (line) => {
+    return line.replace(/\((?:\\.|[^\\)])*\)\s*T[Jj]/g, "");
+  });
+
+  // Nettoyage: espaces multiples devenus inutiles
+  s = s.replace(/[ ]{2,}/g, " ");
+  return s;
 }
 
+async function extractTextFromPDF(buf) {
+  try {
+    if (!pdfParse) {
+      // lazy import pour éviter bug au lancement dans certains environnements
+      const mod = await import("pdf-parse");
+      pdfParse = mod.default || mod;
+    }
+    const data = await pdfParse(buf);
+    return cleanTextBasic(data.text || "");
+  } catch {
+    return "";
+  }
+}
+
+// ----- LanguageTool -----
 async function runLanguageTool(fullText, lang = "auto") {
   const chunks = [];
   for (let i = 0; i < fullText.length; i += 20000) chunks.push(fullText.slice(i, i + 20000));
@@ -252,8 +288,7 @@ async function runLanguageTool(fullText, lang = "auto") {
     form.set("language", lang);
     if (LT_KEY) form.set("apiKey", LT_KEY);
     const r = await axios.post(LT_URL, form.toString(), {
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      timeout: 30000,
+      headers: { "Content-Type": "application/x-www-form-urlencoded" }, timeout: 30000
     });
     if (r?.data?.matches?.length) matches = matches.concat(r.data.matches);
   }
@@ -303,13 +338,13 @@ function buildReportHTML(report) {
   </table></div></div></body></html>`;
 }
 
-/* ---------------- Routes ---------------- */
+// -------- Routes --------
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.post("/clean", upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "Missing file" });
   const p = req.file.path, name = req.file.originalname.toLowerCase();
-  const strict = !!(process.env.PDF_STRICT === "1" || req.query.strict === "1");
+  const strict = String(req.query?.strict || "") === "1";
   try {
     let outBuf, outName, mime;
     if (name.endsWith(".pdf")) {
@@ -320,8 +355,12 @@ app.post("/clean", upload.single("file"), async (req, res) => {
       outBuf = await processDOCXBasic(await fsp.readFile(p));
       outName = req.file.originalname.replace(/\.docx$/i, "") + "_cleaned.docx";
       mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    } else if (name.endsWith(".pptx")) {
+      outBuf = await processPPTXBasic(await fsp.readFile(p));
+      outName = req.file.originalname.replace(/\.pptx$/i, "") + "_cleaned.pptx";
+      mime = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
     } else {
-      return res.status(400).json({ error: "Only PDF or DOCX supported" });
+      return res.status(400).json({ error: "Only PDF, DOCX or PPTX supported" });
     }
     res.setHeader("Content-Type", mime);
     res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(outName)}"`);
@@ -338,21 +377,26 @@ app.post("/clean-v2", upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "Missing file" });
   const p = req.file.path, name = req.file.originalname.toLowerCase();
   const lang = (req.body?.lt_language || "auto").toString();
-  const strict = !!(process.env.PDF_STRICT === "1" || req.query.strict === "1");
+  const strict = String(req.query?.strict || "") === "1";
   try {
     let cleanedBuf, cleanedName, text = "";
     if (name.endsWith(".pdf")) {
       const buf = await fsp.readFile(p);
       cleanedBuf = await processPDFBasic(buf, { strict });
       cleanedName = req.file.originalname.replace(/\.pdf$/i, "") + "_cleaned.pdf";
-      text = await extractTextFromPDF(cleanedBuf); // vide (choix de bêta)
+      text = await extractTextFromPDF(cleanedBuf);
     } else if (name.endsWith(".docx")) {
       const buf = await fsp.readFile(p);
       cleanedBuf = await processDOCXBasic(buf);
       cleanedName = req.file.originalname.replace(/\.docx$/i, "") + "_cleaned.docx";
       text = await extractTextFromDOCX(cleanedBuf);
+    } else if (name.endsWith(".pptx")) {
+      const buf = await fsp.readFile(p);
+      cleanedBuf = await processPPTXBasic(buf);
+      cleanedName = req.file.originalname.replace(/\.pptx$/i, "") + "_cleaned.pptx";
+      text = await extractTextFromPPTX(cleanedBuf);
     } else {
-      return res.status(400).json({ error: "Only PDF or DOCX supported" });
+      return res.status(400).json({ error: "Only PDF, DOCX or PPTX supported" });
     }
 
     const matches = await runLanguageTool(text || "", lang);
@@ -365,7 +409,7 @@ app.post("/clean-v2", upload.single("file"), async (req, res) => {
     zip.file("report.html", reportHTML);
 
     const zipBuf = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
-    const zipName = req.file.originalname.replace(/\.(pdf|docx)$/i, "") + "_docsafe_report.zip";
+    const zipName = req.file.originalname.replace(/\.(pdf|docx|pptx)$/i, "") + "_docsafe_report.zip";
     res.setHeader("Content-Type", "application/zip");
     res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(zipName)}"`);
     res.send(zipBuf);
