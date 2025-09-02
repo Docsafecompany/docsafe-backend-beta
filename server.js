@@ -1,8 +1,15 @@
 /**
- * DocSafe Backend — Beta V2 (CORS OUVERT pour tests, sans pdf-parse)
+ * DocSafe Backend — Beta V2 (Cleaner amélioré)
+ *
+ * Nouveautés:
+ * - cleanTextBasic: supprime doublons de ponctuation (",,", ";;", "!!", "??", "..."), espaces superflus.
+ * - PDF V1: purge métadonnées (Info + dates), enlève JS/Annots/Attachments/AcroForm/OpenAction (durcit la surface d'attaque).
+ * - Mode strict PDF (optionnel): tentative de retrait de texte blanc/invisible dans les flux (regex best-effort).
+ *   Activez-le avec:  1) env PDF_STRICT=1  OU  2) query ?strict=1 sur /clean (PDF uniquement)
+ *
  * Endpoints:
- *  - POST /clean     -> retourne le fichier nettoyé (PDF/DOCX)
- *  - POST /clean-v2  -> nettoyé + rapport LanguageTool en ZIP (cleaned + report.json + report.html)
+ *  - POST /clean     -> PDF/DOCX nettoyé
+ *  - POST /clean-v2  -> nettoyé + rapport LanguageTool (ZIP: cleaned + report.json + report.html)
  *  - GET  /health    -> OK
  */
 import express from "express";
@@ -14,6 +21,7 @@ import os from "os";
 import axios from "axios";
 import JSZip from "jszip";
 import { PDFDocument } from "pdf-lib";
+import pako from "pako";
 
 const app = express();
 
@@ -39,19 +47,29 @@ const LT_KEY = process.env.LT_API_KEY || null;
 
 function cleanTextBasic(str) {
   if (!str) return str;
-  return String(str)
-    .replace(/\u200B/g, "")
-    .replace(/[ \t]+/g, " ")
-    .replace(/ *\n */g, "\n")
-    .replace(/ ?([,;:!?]) ?/g, "$1 ")
-    .replace(/ \./g, ".")
-    .replace(/[ ]{2,}/g, " ")
-    .trim();
+  let s = String(str);
+
+  // Normalisations simples
+  s = s.replace(/\u200B/g, "");                   // zero-width space
+  s = s.replace(/[ \t]+/g, " ");                  // espaces multiples
+  s = s.replace(/ *\n */g, "\n");                 // espaces autour des retours à la ligne
+
+  // Ponctuation: collapse doublons
+  s = s.replace(/([,;:!?])\1+/g, "$1");           // ",,", "!!", "??", ";;", "::"
+  s = s.replace(/\.{3,}/g, "...");                // "....." -> "..."
+  // Espaces autour de la ponctuation
+  s = s.replace(/ ?([,;:!?]) ?/g, "$1 ");         // " , " -> ", "
+  s = s.replace(/ \./g, ".");                     // " ." -> "."
+  s = s.replace(/[ ]{2,}/g, " ");                 // espaces doublons
+
+  // Exemple FR: espace fines avant ;:!? non gérées ici -> on uniformise simple
+  return s.trim();
 }
 
+/* ---------------- DOCX ---------------- */
 async function processDOCXBasic(buf) {
   const zip = await JSZip.loadAsync(buf);
-  // métadonnées
+  // Métadonnées
   const core = "docProps/core.xml";
   if (zip.file(core)) {
     let xml = await zip.file(core).async("string");
@@ -65,7 +83,7 @@ async function processDOCXBasic(buf) {
   }
   if (zip.file("docProps/custom.xml")) zip.remove("docProps/custom.xml");
 
-  // nettoyer texte
+  // Nettoyage du texte
   const docXml = "word/document.xml";
   if (zip.file(docXml)) {
     let xml = await zip.file(docXml).async("string");
@@ -84,26 +102,143 @@ async function extractTextFromDOCX(buf) {
   if (!zip.file(p)) return "";
   const xml = await zip.file(p).async("string");
   let t = "";
-  xml.replace(/<w:t[^>]*>([\s\S]*?)<\/w:t>/g, (_m, inner) => {
-    t += inner + " ";
-    return _m;
-  });
+  xml.replace(/<w:t[^>]*>([\s\S]*?)<\/w:t>/g, (_m, inner) => { t += inner + " "; return _m; });
   return cleanTextBasic(t);
 }
 
-async function processPDFBasic(buf) {
+/* ---------------- PDF ---------------- */
+function _nukeCommonCatalogKeys(pdf) {
+  try {
+    const dict = pdf?.catalog?.dict;
+    if (!dict) return;
+
+    // Supprimer clés qui exposent des actions/JS/attachements/formulaires
+    const kill = [
+      "OpenAction", "AA", "AcroForm", "Lang", "Names", "Outlines",
+      "PageMode", "ViewerPreferences", "URI", "JavaScript", "JS",
+      "Collection", "Metadata" // XMP metadata
+    ];
+    // suppression souple (sans PDFName)
+    for (const k of Array.from(dict.keys?.() || [])) {
+      const keyStr = k?.toString?.() || "";
+      if (kill.some(tag => keyStr.includes(`/${tag}`))) {
+        dict.delete(k);
+      }
+    }
+  } catch {}
+}
+
+function _stripAnnotsAndActions(pdf) {
+  try {
+    for (const page of pdf.getPages()) {
+      // Enlever annotations (liens, commentaires, etc.)
+      // Accès souple au dictionnaire interne (pas d'API publique stricte)
+      const node = page.node;
+      const keys = Array.from(node.dict?.keys?.() || []);
+      for (const k of keys) {
+        const ks = k?.toString?.() || "";
+        if (ks.includes("/Annots")) node.dict.delete(k);
+        if (ks.includes("/AA")) node.dict.delete(k);          // actions supplémentaires
+      }
+    }
+  } catch {}
+}
+
+// Best-effort: supprime texte blanc/invisible de certains flux
+function _tryStripWhiteOrInvisible(streamBytes) {
+  // Détection/édition via regex sur contenu texte (si FlateDecode -> décodé avant)
+  const str = new TextDecoder("latin1").decode(streamBytes);
+
+  // Retire séquences: "1 1 1 rg ... (text) Tj" ou "[...] TJ"
+  const rgWhite = /(?:^|\s)(?:1(?:\.0+)?\s+){2}1(?:\.0+)?\s+rg[\s\S]{0,400}?(?:\([^\)]*\)\s*Tj|\[[^\]]*\]\s*TJ)/g;
+  // Retire texte en mode rendu invisible "3 Tr ... (text) Tj/TJ"
+  const trInvisible = /(?:^|\s)3\s+Tr[\s\S]{0,400}?(?:\([^\)]*\)\s*Tj|\[[^\]]*\]\s*TJ)/g;
+
+  let out = str.replace(rgWhite, "");
+  out = out.replace(trInvisible, "");
+
+  return new TextEncoder().encode(out);
+}
+
+async function processPDFBasic(buf, { strict = false } = {}) {
   const pdf = await PDFDocument.load(buf, { updateMetadata: true });
+
+  // 1) Métadonnées "Info"
   pdf.setTitle(""); pdf.setAuthor(""); pdf.setSubject("");
   pdf.setKeywords([]); pdf.setProducer(""); pdf.setCreator("");
   const epoch = new Date(0);
   pdf.setCreationDate(epoch); pdf.setModificationDate(epoch);
-  const out = await pdf.save();
+
+  // 2) Purge durcie du catalogue (XMP metadata, JS, actions, attachements, formulaires…)
+  _nukeCommonCatalogKeys(pdf);
+
+  // 3) Pages: enlever annotations & actions
+  _stripAnnotsAndActions(pdf);
+
+  // 4) (Optionnel) STRIP flux "texte blanc / invisible"
+  if (strict) {
+    try {
+      const context = pdf.context;
+      for (const page of pdf.getPages()) {
+        // Récupère la réf "Contents" (un stream ou un array de streams)
+        const node = page.node;
+        const contentsRef = node.dict.get?.(Object.fromEntries([])); // placeholder to keep TS calm
+        // Accès plus permissif:
+        const dict = node.dict;
+        const contentsKey = Array.from(dict.keys?.() || []).find(k => (k?.toString?.() || "").includes("/Contents"));
+        if (!contentsKey) continue;
+        const raw = dict.get(contentsKey);
+
+        const asArray = Array.isArray(raw?.array) ? raw.array : (raw ? [raw] : []);
+        const newStreams = [];
+
+        for (const ref of asArray) {
+          const stream = context.lookup(ref); // PDFRawStream or similar
+          if (!stream) continue;
+          let bytes = stream.contents || stream.getContents?.();
+          if (!bytes) continue;
+
+          // Décode si FlateDecode
+          const dictS = stream.dict;
+          const keys = Array.from(dictS.keys?.() || []);
+          const hasFlate = keys.some(k => (k?.toString?.() || "").includes("/Filter")) &&
+            String(dictS.get?.(keys.find(k => (k?.toString?.() || "").includes("/Filter")))).includes("Flate");
+
+          let decoded = bytes;
+          if (hasFlate) {
+            try { decoded = pako.inflate(bytes); } catch {}
+          }
+
+          // STRIP
+          const cleaned = _tryStripWhiteOrInvisible(decoded);
+
+          // Re-encode si nécessaire
+          let finalBytes = cleaned;
+          if (hasFlate) {
+            try { finalBytes = pako.deflate(cleaned); } catch {}
+          }
+
+          // Remplace le contenu et met à jour /Length
+          stream.contents = finalBytes;
+          const lenKey = Array.from(dictS.keys?.() || []).find(k => (k?.toString?.() || "").includes("/Length"));
+          if (lenKey) dictS.set?.(lenKey, context.obj(finalBytes.length));
+          newStreams.push(stream);
+        }
+      }
+    } catch {
+      // en cas d'échec silencieux, on laisse le PDF tel quel (au pire: seules les métadonnées/annots/JS sont purgées)
+    }
+  }
+
+  const out = await pdf.save({ useObjectStreams: false });
   return Buffer.from(out);
 }
 
-/* IMPORTANT : on ne lit plus le texte PDF (pas de pdf-parse en prod bêta) */
+/* ---------------- LT ---------------- */
 async function extractTextFromPDF(_buf) {
-  return ""; // V2 sur PDF => rapport vide, mais cleaning OK
+  // Dans cette bêta, on ne lit pas le texte PDF (pour éviter les crashs sur certains fichiers).
+  // => Rapport LT vide pour PDF, mais cleaning OK.
+  return "";
 }
 
 async function runLanguageTool(fullText, lang = "auto") {
@@ -136,19 +271,17 @@ function buildReportJSON({ fileName, language, matches, textLength }) {
 
 function buildReportHTML(report) {
   const { summary, matches } = report;
-  const rows = matches
-    .map((m, i) => {
-      const repl = (m.replacements || []).slice(0, 3).map((r) => r.value).join(", ");
-      const ctx = (m.context?.text || "").replace(/</g, "&lt;");
-      return `<tr>
+  const rows = matches.map((m, i) => {
+    const repl = (m.replacements || []).slice(0, 3).map(r => r.value).join(", ");
+    const ctx = (m.context?.text || "").replace(/</g, "&lt;");
+    return `<tr>
       <td style="padding:8px;border-bottom:1px solid #e5e7eb;">${i + 1}</td>
       <td style="padding:8px;border-bottom:1px solid #e5e7eb;">${m.rule?.id || ""}</td>
       <td style="padding:8px;border-bottom:1px solid #e5e7eb;">${(m.message || "").replace(/</g,"&lt;")}</td>
       <td style="padding:8px;border-bottom:1px solid #e5e7eb;">${repl || "-"}</td>
       <td style="padding:8px;border-bottom:1px solid #e5e7eb;">${ctx}</td>
     </tr>`;
-    })
-    .join("");
+  }).join("");
   return `<!doctype html><html><head><meta charset="utf-8"><title>DocSafe Report</title>
   <meta name="viewport" content="width=device-width,initial-scale=1"><style>
   body{font-family:system-ui,Segoe UI,Roboto,Ubuntu,sans-serif;background:#0f172a;color:#e5e7eb;margin:0;padding:24px}
@@ -176,10 +309,11 @@ app.get("/health", (req, res) => res.json({ ok: true }));
 app.post("/clean", upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "Missing file" });
   const p = req.file.path, name = req.file.originalname.toLowerCase();
+  const strict = !!(process.env.PDF_STRICT === "1" || req.query.strict === "1");
   try {
     let outBuf, outName, mime;
     if (name.endsWith(".pdf")) {
-      outBuf = await processPDFBasic(await fsp.readFile(p));
+      outBuf = await processPDFBasic(await fsp.readFile(p), { strict });
       outName = req.file.originalname.replace(/\.pdf$/i, "") + "_cleaned.pdf";
       mime = "application/pdf";
     } else if (name.endsWith(".docx")) {
@@ -204,13 +338,14 @@ app.post("/clean-v2", upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "Missing file" });
   const p = req.file.path, name = req.file.originalname.toLowerCase();
   const lang = (req.body?.lt_language || "auto").toString();
+  const strict = !!(process.env.PDF_STRICT === "1" || req.query.strict === "1");
   try {
     let cleanedBuf, cleanedName, text = "";
     if (name.endsWith(".pdf")) {
       const buf = await fsp.readFile(p);
-      cleanedBuf = await processPDFBasic(buf);
+      cleanedBuf = await processPDFBasic(buf, { strict });
       cleanedName = req.file.originalname.replace(/\.pdf$/i, "") + "_cleaned.pdf";
-      text = await extractTextFromPDF(cleanedBuf); // retournera ""
+      text = await extractTextFromPDF(cleanedBuf); // vide (choix de bêta)
     } else if (name.endsWith(".docx")) {
       const buf = await fsp.readFile(p);
       cleanedBuf = await processDOCXBasic(buf);
@@ -221,9 +356,7 @@ app.post("/clean-v2", upload.single("file"), async (req, res) => {
     }
 
     const matches = await runLanguageTool(text || "", lang);
-    const reportJSON = buildReportJSON({
-      fileName: cleanedName, language: lang, matches, textLength: (text || "").length,
-    });
+    const reportJSON = buildReportJSON({ fileName: cleanedName, language: lang, matches, textLength: (text || "").length });
     const reportHTML = buildReportHTML(reportJSON);
 
     const zip = new JSZip();
@@ -246,3 +379,4 @@ app.post("/clean-v2", upload.single("file"), async (req, res) => {
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log("DocSafe backend running on port", PORT));
+
