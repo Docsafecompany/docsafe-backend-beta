@@ -1,11 +1,5 @@
 /**
- * DocSafe Backend — Beta V2
- * Endpoints:
- *  - POST /clean     -> retourne le fichier nettoyé (PDF/DOCX/PPTX)
- *  - POST /clean-v2  -> nettoyé + rapport LanguageTool en ZIP (cleaned + report.json + report.html)
- *  - GET  /health    -> OK
- *
- * Option: /clean?strict=1 (PDF) -> tentative de retrait de texte blanc/invisible
+ * DocSafe Backend — Beta V2 (clean PDF/DOCX/PPTX + LT report)
  */
 import express from "express";
 import cors from "cors";
@@ -18,7 +12,7 @@ import JSZip from "jszip";
 import { PDFDocument, PDFName } from "pdf-lib";
 import zlib from "zlib";
 
-let pdfParse = null; // lazy import pour éviter les soucis d'init
+let pdfParse = null; // lazy import
 
 const app = express();
 
@@ -45,7 +39,7 @@ const upload = multer({
     destination: (req, file, cb) => cb(null, os.tmpdir()),
     filename: (req, file, cb) => cb(null, Date.now() + "-" + file.originalname.replace(/\s+/g, "_"))
   }),
-  limits: { fileSize: 20 * 1024 * 1024 } // 20 Mo
+  limits: { fileSize: 20 * 1024 * 1024 }
 });
 
 /* -------------- Helpers --------------- */
@@ -54,21 +48,52 @@ const LT_KEY = process.env.LT_API_KEY || null;
 
 function cleanTextBasic(str) {
   if (!str) return str;
-  return String(str)
-    .replace(/\u200B/g, "")           // zero-width space
-    .replace(/[ \t]+/g, " ")          // espaces multiples
-    .replace(/ *\n */g, "\n")
-    .replace(/ ?([,;:!?]) ?/g, "$1 ") // ponctuation collée
-    .replace(/ \./g, ".")
-    .replace(/[ ]{2,}/g, " ")
-    .replace(/,,+/g, ",")             // doubles virgules
-    .replace(/;;+/g, ";")
-    .trim();
+  let s = String(str);
+
+  // Remove zero-width & soft characters
+  s = s.replace(/\u200B|\u2060|\uFEFF/g, "");
+
+  // Normalize spaces & line breaks
+  s = s.replace(/[ \t]+/g, " ")
+       .replace(/ *\n */g, "\n");
+
+  // Normalize punctuation spacing (keep "..." intact)
+  s = s.replace(/ ?([,;:!?]) ?/g, "$1 ")
+       .replace(/ \./g, ".");
+
+  // Collapse duplicates
+  s = s
+    .replace(/,{2,}/g, ",")
+    .replace(/@{2,}/g, "@")
+    .replace(/;{2,}/g, ";")
+    .replace(/:{2,}/g, ":")
+    .replace(/!{2,}/g, "!")
+    .replace(/\?{2,}/g, "?");
+
+  // Final trim
+  s = s.replace(/[ ]{2,}/g, " ").trim();
+  return s;
+}
+
+/** Collapse duplicates that fall ACROSS XML text nodes.
+ *  Example: ",</w:t><w:t>,"  => ",</w:t><w:t>"
+ */
+function collapseAcrossNodes(xml, tag) {
+  // duplicate punctuations across nodes: , ; : ! ? @
+  const reDupe = new RegExp(`([,;:!?@])<\\/${tag}>\\s*<${tag}[^>]*>\\1`, "g");
+  xml = xml.replace(reDupe, (_m, p1) => `${p1}</${tag}><${tag}>`);
+
+  // remove weird spaces around node boundaries (space before/after)
+  const reSpace1 = new RegExp(`\\s+<\\/${tag}>\\s*<${tag}[^>]*>`, "g");
+  xml = xml.replace(reSpace1, `</${tag}><${tag}>`);
+  return xml;
 }
 
 /* -------------- DOCX ------------------ */
 async function processDOCXBasic(buf) {
   const zip = await JSZip.loadAsync(buf);
+
+  // strip core/custom props
   const core = "docProps/core.xml";
   if (zip.file(core)) {
     let xml = await zip.file(core).async("string");
@@ -82,10 +107,14 @@ async function processDOCXBasic(buf) {
   }
   if (zip.file("docProps/custom.xml")) zip.remove("docProps/custom.xml");
 
+  // clean text nodes + cross-node collapse
   const docXml = "word/document.xml";
   if (zip.file(docXml)) {
     let xml = await zip.file(docXml).async("string");
+    // Per-node cleaning
     xml = xml.replace(/<w:t[^>]*>([\s\S]*?)<\/w:t>/g, (m, inner) => m.replace(inner, cleanTextBasic(inner)));
+    // Cross-node punctuation duplicates
+    xml = collapseAcrossNodes(xml, "w:t");
     zip.file(docXml, xml);
   }
   return await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
@@ -104,6 +133,8 @@ async function extractTextFromDOCX(buf) {
 /* -------------- PPTX ------------------ */
 async function processPPTXBasic(buf) {
   const zip = await JSZip.loadAsync(buf);
+
+  // strip core/custom props
   const core = "docProps/core.xml";
   if (zip.file(core)) {
     let xml = await zip.file(core).async("string");
@@ -117,10 +148,14 @@ async function processPPTXBasic(buf) {
   }
   if (zip.file("docProps/custom.xml")) zip.remove("docProps/custom.xml");
 
+  // Clean slide text nodes
   const slideFiles = Object.keys(zip.files).filter(p => /^ppt\/slides\/slide\d+\.xml$/i.test(p));
   for (const p of slideFiles) {
     let xml = await zip.file(p).async("string");
+    // Per-node cleaning
     xml = xml.replace(/<a:t[^>]*>([\s\S]*?)<\/a:t>/g, (m, inner) => m.replace(inner, cleanTextBasic(inner)));
+    // Cross-node collapse
+    xml = collapseAcrossNodes(xml, "a:t");
     zip.file(p, xml);
   }
   return await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
@@ -141,16 +176,16 @@ async function extractTextFromPPTX(buf) {
 async function processPDFBasic(buf, { strict = false } = {}) {
   const pdf = await PDFDocument.load(buf, { updateMetadata: true });
 
-  // Vider les métadonnées usuelles
+  // Clear standard metadata
   pdf.setTitle(""); pdf.setAuthor(""); pdf.setSubject("");
   pdf.setKeywords([]); pdf.setProducer(""); pdf.setCreator("");
   const epoch = new Date(0);
   pdf.setCreationDate(epoch); pdf.setModificationDate(epoch);
 
-  // Retirer le flux XMP /Metadata du Catalog (si présent)
+  // Remove XMP metadata stream if any
   try { pdf.catalog?.dict?.delete(PDFName.of("Metadata")); } catch {}
 
-  // Retirer éléments potentiellement sensibles
+  // Remove potentially sensitive catalog entries
   try {
     const dict = pdf.catalog?.dict;
     if (dict) {
@@ -163,13 +198,11 @@ async function processPDFBasic(buf, { strict = false } = {}) {
 
   let outBuf = Buffer.from(await pdf.save({ useObjectStreams: false }));
 
-  // Mode strict: tentative de suppression de texte invisible/blanc dans les streams
   if (strict) outBuf = tryStripHiddenText(outBuf);
-
   return outBuf;
 }
 
-// Heuristique: supprime Tj/TJ quand précédés de "3 Tr" (invisible) ou "1 1 1 rg" (blanc)
+// Heuristic removal of invisible/white text in content streams
 function tryStripHiddenText(pdfBuf) {
   const src = pdfBuf.toString("binary");
   const parts = [];
@@ -183,8 +216,8 @@ function tryStripHiddenText(pdfBuf) {
     const eol = (eCR !== -1 && (eLine === -1 || eCR < eLine)) ? eCR + 2 : eLine + 1;
     const endIdx = src.indexOf("endstream", eol);
     if (endIdx === -1) { parts.push([idx, src.length, null]); break; }
-    parts.push([idx, sIdx, null]);       // header
-    parts.push([eol, endIdx, "stream"]); // data
+    parts.push([idx, sIdx, null]);
+    parts.push([eol, endIdx, "stream"]);
     idx = endIdx;
   }
 
@@ -197,7 +230,15 @@ function tryStripHiddenText(pdfBuf) {
     let inflated = null;
     try { inflated = zlib.inflateSync(Buffer.from(chunk, "binary")); data = inflated.toString("binary"); } catch {}
 
-    const cleaned = stripOpsInStream(data);
+    // remove text after "3 Tr" (invisible) or with white fill "1 1 1 rg"
+    let cleaned = data.replace(/\r\n/g, "\n");
+    cleaned = cleaned.replace(/(?:^|\n)([^]*?)\b3\s+Tr[^\n]*\n/g, line =>
+      line.replace(/\((?:\\.|[^\\)])*\)\s*T[Jj]/g, "")
+    );
+    cleaned = cleaned.replace(/(?:^|\n)([^]*?)\b1(?:\.0+)?\s+1(?:\.0+)?\s+1(?:\.0+)?\s+rg[^\n]*\n/g, line =>
+      line.replace(/\((?:\\.|[^\\)])*\)\s*T[Jj]/g, "")
+    );
+    cleaned = cleaned.replace(/[ ]{2,}/g, " ");
 
     let out;
     try {
@@ -211,21 +252,7 @@ function tryStripHiddenText(pdfBuf) {
 
     rebuilt += out;
   }
-
   return Buffer.from(rebuilt, "binary");
-}
-
-function stripOpsInStream(data) {
-  let s = data.replace(/\r\n/g, "\n");
-  // Invisible (3 Tr)
-  s = s.replace(/(?:^|\n)([^]*?)\b3\s+Tr[^\n]*\n/g, line =>
-    line.replace(/\((?:\\.|[^\\)])*\)\s*T[Jj]/g, "")
-  );
-  // Blanc (1 1 1 rg)
-  s = s.replace(/(?:^|\n)([^]*?)\b1(?:\.0+)?\s+1(?:\.0+)?\s+1(?:\.0+)?\s+rg[^\n]*\n/g, line =>
-    line.replace(/\((?:\\.|[^\\)])*\)\s*T[Jj]/g, "")
-  );
-  return s.replace(/[ ]{2,}/g, " ");
 }
 
 async function extractTextFromPDF(buf) {
@@ -291,13 +318,14 @@ function buildReportHTML(report) {
   th{background:#111827;text-align:left;padding:10px;border-bottom:1px solid #1f2937}
   td{vertical-align:top}
   </style></head><body><div class="card">
-  <h1>Rapport LanguageTool</h1><div class="section"><div class="kv">
-  <div><b>Fichier:</b> ${summary.fileName}</div>
-  <div><b>Langue:</b> ${summary.language}</div>
-  <div><b>Longueur:</b> ${summary.textLength}</div>
+  <h1>LanguageTool Report</h1><div class="section"><div class="kv">
+  <div><b>File:</b> ${summary.fileName}</div>
+  <div><b>Language:</b> ${summary.language}</div>
+  <div><b>Length:</b> ${summary.textLength}</div>
   <div><b>Total issues:</b> ${summary.totalIssues}</div>
-  </div><table class="table"><thead><tr><th>#</th><th>Règle</th><th>Message</th><th>Suggestions</th><th>Contexte</th></tr></thead>
-  <tbody>${rows || `<tr><td colspan="5" style="padding:10px">Aucune suggestion.</td></tr>`}</tbody>
+  </div>${report.infoBanner || ""}
+  <table class="table"><thead><tr><th>#</th><th>Rule</th><th>Message</th><th>Suggestions</th><th>Context</th></tr></thead>
+  <tbody>${rows || `<tr><td colspan="5" style="padding:10px">No suggestions.</td></tr>`}</tbody>
   </table></div></div></body></html>`;
 }
 
@@ -362,9 +390,16 @@ app.post("/clean-v2", upload.single("file"), async (req, res) => {
       return res.status(400).json({ error: "Only PDF, DOCX or PPTX supported" });
     }
 
-    const matches = await runLanguageTool(text || "", lang);
+    let matches = [];
+    let ltNote = null;
+    try {
+      matches = await runLanguageTool(text || "", lang);
+    } catch (e) {
+      ltNote = "LanguageTool unavailable (network/quota). Report generated without suggestions.";
+    }
+
     const reportJSON = buildReportJSON({ fileName: cleanedName, language: lang, matches, textLength: (text || "").length });
-    const reportHTML = buildReportHTML(reportJSON);
+    const reportHTML = buildReportHTML({ ...reportJSON, infoBanner: ltNote ? `<div style="margin:12px 0;padding:10px 12px;border-radius:10px;background:#3b82f6;color:#fff">${ltNote}</div>` : "" });
 
     const zip = new JSZip();
     zip.file(cleanedName, cleanedBuf);
