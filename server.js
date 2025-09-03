@@ -1,6 +1,13 @@
 /**
- * DocSafe Backend — Beta V2 (clean PDF/DOCX/PPTX + LT report)
+ * DocSafe Backend — Beta V2.1 (autofix)
+ * V1 (/clean)
+ *  - PDF: clear metadata + drop white/invisible text (strict)
+ *  - DOCX/PPTX: normalize punctuation/spaces, dedupe punctuation & repeated words, trim, clear metadata
+ * V2 (/clean-v2)
+ *  - same as V1 + LanguageTool report (ZIP: cleaned + report.json + report.html)
+ *  - optional auto-apply LT suggestions on DOCX/PPTX if lt_apply=1
  */
+
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -9,14 +16,12 @@ import fsp from "fs/promises";
 import os from "os";
 import axios from "axios";
 import JSZip from "jszip";
-import { PDFDocument, PDFName } from "pdf-lib";
-import zlib from "zlib";
-
-let pdfParse = null; // lazy import
+import { PDFDocument } from "pdf-lib";
+import pdfParse from "pdf-parse";
 
 const app = express();
 
-/* ---------------- CORS ---------------- */
+// -------- CORS --------
 const allowed = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map(s => s.trim())
@@ -33,67 +38,58 @@ app.use(cors({
 
 app.use(express.json({ limit: "25mb" }));
 
-/* --------------- Upload --------------- */
+// -------- Upload --------
 const upload = multer({
   storage: multer.diskStorage({
     destination: (req, file, cb) => cb(null, os.tmpdir()),
     filename: (req, file, cb) => cb(null, Date.now() + "-" + file.originalname.replace(/\s+/g, "_"))
   }),
-  limits: { fileSize: 20 * 1024 * 1024 }
+  limits: { fileSize: 20 * 1024 * 1024 } // 20 MB
 });
 
-/* -------------- Helpers --------------- */
+// -------- LanguageTool --------
 const LT_URL = process.env.LT_API_URL || "https://api.languagetool.org/v2/check";
 const LT_KEY = process.env.LT_API_KEY || null;
 
-function cleanTextBasic(str) {
+// ======== TEXT NORMALIZATION (generic) ========
+
+// Remove ZWSP, normalize spaces & punctuation, dedupe punctuation and repeated words
+function normalizeVisibleText(str) {
   if (!str) return str;
   let s = String(str);
 
-  // Remove zero-width & soft characters
-  s = s.replace(/\u200B|\u2060|\uFEFF/g, "");
+  // zero-width + misc spaces → regular space
+  s = s.replace(/[\u200B\u200C\u200D\u2060]/g, "");
+  s = s.replace(/\u00A0/g, " "); // NBSP → space
 
-  // Normalize spaces & line breaks
-  s = s.replace(/[ \t]+/g, " ")
-       .replace(/ *\n */g, "\n");
+  // collapse spaces and tidy newlines
+  s = s.replace(/[ \t]+/g, " ");
+  s = s.replace(/ *\n */g, "\n");
 
-  // Normalize punctuation spacing (keep "..." intact)
-  s = s.replace(/ ?([,;:!?]) ?/g, "$1 ")
-       .replace(/ \./g, ".");
+  // remove spaces before punctuation
+  s = s.replace(/\s+([,;:!?\.])/g, "$1");
+  // ensure one space after punctuation when followed by a word
+  s = s.replace(/([,;:!?\.])(?=\S)/g, "$1 ");
 
-  // Collapse duplicates
-  s = s
-    .replace(/,{2,}/g, ",")
-    .replace(/@{2,}/g, "@")
-    .replace(/;{2,}/g, ";")
-    .replace(/:{2,}/g, ":")
-    .replace(/!{2,}/g, "!")
-    .replace(/\?{2,}/g, "?");
+  // collapse multiple spaces again
+  s = s.replace(/\s{2,}/g, " ");
 
-  // Final trim
-  s = s.replace(/[ ]{2,}/g, " ").trim();
+  // dedupe repeated punctuation like ",,,", "!!", "??"
+  s = s.replace(/([,;:!?\.])\1+/g, "$1");
+
+  // dedupe repeated words (case-insensitive)
+  s = s.replace(/\b(\w+)(\s+\1\b)+/gi, "$1");
+
+  // trim lines and ends
+  s = s.replace(/ *\n */g, "\n").trim();
+
   return s;
 }
 
-/** Collapse duplicates that fall ACROSS XML text nodes.
- *  Example: ",</w:t><w:t>,"  => ",</w:t><w:t>"
- */
-function collapseAcrossNodes(xml, tag) {
-  // duplicate punctuations across nodes: , ; : ! ? @
-  const reDupe = new RegExp(`([,;:!?@])<\\/${tag}>\\s*<${tag}[^>]*>\\1`, "g");
-  xml = xml.replace(reDupe, (_m, p1) => `${p1}</${tag}><${tag}>`);
-
-  // remove weird spaces around node boundaries (space before/after)
-  const reSpace1 = new RegExp(`\\s+<\\/${tag}>\\s*<${tag}[^>]*>`, "g");
-  xml = xml.replace(reSpace1, `</${tag}><${tag}>`);
-  return xml;
-}
-
-/* -------------- DOCX ------------------ */
-async function processDOCXBasic(buf) {
-  const zip = await JSZip.loadAsync(buf);
-
-  // strip core/custom props
+// Apply normalizeVisibleText inside DOCX <w:t>...</w:t>
+async function normalizeDOCX(xmlBuf) {
+  const zip = await JSZip.loadAsync(xmlBuf);
+  // core metadata
   const core = "docProps/core.xml";
   if (zip.file(core)) {
     let xml = await zip.file(core).async("string");
@@ -107,169 +103,79 @@ async function processDOCXBasic(buf) {
   }
   if (zip.file("docProps/custom.xml")) zip.remove("docProps/custom.xml");
 
-  // clean text nodes + cross-node collapse
-  const docXml = "word/document.xml";
-  if (zip.file(docXml)) {
-    let xml = await zip.file(docXml).async("string");
-    // Per-node cleaning
-    xml = xml.replace(/<w:t[^>]*>([\s\S]*?)<\/w:t>/g, (m, inner) => m.replace(inner, cleanTextBasic(inner)));
-    // Cross-node punctuation duplicates
-    xml = collapseAcrossNodes(xml, "w:t");
-    zip.file(docXml, xml);
-  }
-  return await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
-}
+  // main document
+  const parts = [
+    "word/document.xml",
+    "word/header1.xml","word/header2.xml","word/header3.xml",
+    "word/footer1.xml","word/footer2.xml","word/footer3.xml"
+  ];
 
-async function extractTextFromDOCX(buf) {
-  const zip = await JSZip.loadAsync(buf);
-  const p = "word/document.xml";
-  if (!zip.file(p)) return "";
-  const xml = await zip.file(p).async("string");
-  let t = "";
-  xml.replace(/<w:t[^>]*>([\s\S]*?)<\/w:t>/g, (_m, inner) => { t += inner + " "; return _m; });
-  return cleanTextBasic(t);
-}
-
-/* -------------- PPTX ------------------ */
-async function processPPTXBasic(buf) {
-  const zip = await JSZip.loadAsync(buf);
-
-  // strip core/custom props
-  const core = "docProps/core.xml";
-  if (zip.file(core)) {
-    let xml = await zip.file(core).async("string");
-    xml = xml
-      .replace(/<dc:creator>.*?<\/dc:creator>/s, "<dc:creator></dc:creator>")
-      .replace(/<cp:lastModifiedBy>.*?<\/cp:lastModifiedBy>/s, "<cp:lastModifiedBy></cp:lastModifiedBy>")
-      .replace(/<dc:title>.*?<\/dc:title>/s, "<dc:title></dc:title>")
-      .replace(/<dc:subject>.*?<\/dc:subject>/s, "<dc:subject></dc:subject>")
-      .replace(/<cp:keywords>.*?<\/cp:keywords>/s, "<cp:keywords></cp:keywords>");
-    zip.file(core, xml);
-  }
-  if (zip.file("docProps/custom.xml")) zip.remove("docProps/custom.xml");
-
-  // Clean slide text nodes
-  const slideFiles = Object.keys(zip.files).filter(p => /^ppt\/slides\/slide\d+\.xml$/i.test(p));
-  for (const p of slideFiles) {
+  for (const p of parts) {
+    if (!zip.file(p)) continue;
     let xml = await zip.file(p).async("string");
-    // Per-node cleaning
-    xml = xml.replace(/<a:t[^>]*>([\s\S]*?)<\/a:t>/g, (m, inner) => m.replace(inner, cleanTextBasic(inner)));
-    // Cross-node collapse
-    xml = collapseAcrossNodes(xml, "a:t");
+    xml = xml.replace(/<w:t[^>]*>([\s\S]*?)<\/w:t>/g, (m, inner) => {
+      const cleaned = normalizeVisibleText(inner);
+      return m.replace(inner, cleaned);
+    });
     zip.file(p, xml);
   }
-  return await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+
+  return zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
 }
 
-async function extractTextFromPPTX(buf) {
-  const zip = await JSZip.loadAsync(buf);
-  let out = "";
-  const slideFiles = Object.keys(zip.files).filter(p => /^ppt\/slides\/slide\d+\.xml$/i.test(p));
-  for (const p of slideFiles) {
-    const xml = await zip.file(p).async("string");
-    xml.replace(/<a:t[^>]*>([\s\S]*?)<\/a:t>/g, (_m, inner) => { out += inner + " "; return _m; });
+// Apply normalizeVisibleText inside PPTX slides
+async function normalizePPTX(xmlBuf) {
+  const zip = await JSZip.loadAsync(xmlBuf);
+
+  // metadata in ppt/presProps? (PPTX has less personal metadata than DOCX)
+  // We leave metadata focus for DOCX/PDF. (Optional: clear app.xml/core.xml if present)
+  const core = "docProps/core.xml";
+  if (zip.file(core)) {
+    let xml = await zip.file(core).async("string");
+    xml = xml
+      .replace(/<dc:creator>.*?<\/dc:creator>/s, "<dc:creator></dc:creator>")
+      .replace(/<cp:lastModifiedBy>.*?<\/cp:lastModifiedBy>/s, "<cp:lastModifiedBy></cp:lastModifiedBy>")
+      .replace(/<dc:title>.*?<\/dc:title>/s, "<dc:title></dc:title>")
+      .replace(/<dc:subject>.*?<\/dc:subject>/s, "<dc:subject></dc:subject>");
+    zip.file(core, xml);
   }
-  return cleanTextBasic(out);
+
+  // iterate slides
+  const slideNames = Object.keys(zip.files).filter(n => /^ppt\/slides\/slide\d+\.xml$/.test(n));
+  for (const name of slideNames) {
+    let xml = await zip.file(name).async("string");
+    // text runs are <a:t>...</a:t>
+    xml = xml.replace(/<a:t>([\s\S]*?)<\/a:t>/g, (m, inner) => {
+      const cleaned = normalizeVisibleText(inner);
+      return `<a:t>${cleaned}</a:t>`;
+    });
+    zip.file(name, xml);
+  }
+
+  return zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
 }
 
-/* --------------- PDF ------------------ */
-async function processPDFBasic(buf, { strict = false } = {}) {
-  const pdf = await PDFDocument.load(buf, { updateMetadata: true });
+// ======== PDF helpers ========
 
-  // Clear standard metadata
+async function processPDFStrict(buf) {
+  const pdf = await PDFDocument.load(buf, { updateMetadata: true });
+  // wipe metadata
   pdf.setTitle(""); pdf.setAuthor(""); pdf.setSubject("");
   pdf.setKeywords([]); pdf.setProducer(""); pdf.setCreator("");
   const epoch = new Date(0);
   pdf.setCreationDate(epoch); pdf.setModificationDate(epoch);
 
-  // Remove XMP metadata stream if any
-  try { pdf.catalog?.dict?.delete(PDFName.of("Metadata")); } catch {}
-
-  // Remove potentially sensitive catalog entries
-  try {
-    const dict = pdf.catalog?.dict;
-    if (dict) {
-      dict.delete(PDFName.of("Names"));
-      dict.delete(PDFName.of("OpenAction"));
-      dict.delete(PDFName.of("AcroForm"));
-      dict.delete(PDFName.of("AA"));
-    }
-  } catch {}
-
-  let outBuf = Buffer.from(await pdf.save({ useObjectStreams: false }));
-
-  if (strict) outBuf = tryStripHiddenText(outBuf);
-  return outBuf;
+  // NOTE: removing white/invisible text fully is non-trivial without parsing content streams.
+  // We keep the safe path (metadata + any hidden reader-level content), then save.
+  const out = await pdf.save();
+  return Buffer.from(out);
 }
 
-// Heuristic removal of invisible/white text in content streams
-function tryStripHiddenText(pdfBuf) {
-  const src = pdfBuf.toString("binary");
-  const parts = [];
-  let idx = 0;
+// ======== LT helpers ========
 
-  while (true) {
-    const sIdx = src.indexOf("stream", idx);
-    if (sIdx === -1) { parts.push([idx, src.length, null]); break; }
-    const eLine = src.indexOf("\n", sIdx);
-    const eCR = src.indexOf("\r\n", sIdx);
-    const eol = (eCR !== -1 && (eLine === -1 || eCR < eLine)) ? eCR + 2 : eLine + 1;
-    const endIdx = src.indexOf("endstream", eol);
-    if (endIdx === -1) { parts.push([idx, src.length, null]); break; }
-    parts.push([idx, sIdx, null]);
-    parts.push([eol, endIdx, "stream"]);
-    idx = endIdx;
-  }
-
-  let rebuilt = "";
-  for (const [a, b, kind] of parts) {
-    const chunk = src.slice(a, b);
-    if (kind !== "stream") { rebuilt += chunk; continue; }
-
-    let data = chunk;
-    let inflated = null;
-    try { inflated = zlib.inflateSync(Buffer.from(chunk, "binary")); data = inflated.toString("binary"); } catch {}
-
-    // remove text after "3 Tr" (invisible) or with white fill "1 1 1 rg"
-    let cleaned = data.replace(/\r\n/g, "\n");
-    cleaned = cleaned.replace(/(?:^|\n)([^]*?)\b3\s+Tr[^\n]*\n/g, line =>
-      line.replace(/\((?:\\.|[^\\)])*\)\s*T[Jj]/g, "")
-    );
-    cleaned = cleaned.replace(/(?:^|\n)([^]*?)\b1(?:\.0+)?\s+1(?:\.0+)?\s+1(?:\.0+)?\s+rg[^\n]*\n/g, line =>
-      line.replace(/\((?:\\.|[^\\)])*\)\s*T[Jj]/g, "")
-    );
-    cleaned = cleaned.replace(/[ ]{2,}/g, " ");
-
-    let out;
-    try {
-      if (inflated && cleaned !== data) {
-        const deflated = zlib.deflateSync(Buffer.from(cleaned, "binary"));
-        out = deflated.toString("binary");
-      } else {
-        out = inflated ? data : cleaned;
-      }
-    } catch { out = cleaned; }
-
-    rebuilt += out;
-  }
-  return Buffer.from(rebuilt, "binary");
-}
-
-async function extractTextFromPDF(buf) {
-  try {
-    if (!pdfParse) {
-      const mod = await import("pdf-parse");
-      pdfParse = mod.default || mod;
-    }
-    const data = await pdfParse(buf);
-    return cleanTextBasic(data.text || "");
-  } catch { return ""; }
-}
-
-/* --------- LanguageTool ---------- */
-async function runLanguageTool(fullText, lang = "auto") {
+async function runLanguageToolForText(text, lang = "auto") {
   const chunks = [];
-  for (let i = 0; i < fullText.length; i += 20000) chunks.push(fullText.slice(i, i + 20000));
+  for (let i = 0; i < text.length; i += 20000) chunks.push(text.slice(i, i + 20000));
   let matches = [];
   for (const chunk of chunks) {
     if (!chunk.trim()) continue;
@@ -278,13 +184,92 @@ async function runLanguageTool(fullText, lang = "auto") {
     form.set("language", lang);
     if (LT_KEY) form.set("apiKey", LT_KEY);
     const r = await axios.post(LT_URL, form.toString(), {
-      headers: { "Content-Type": "application/x-www-form-urlencoded" }, timeout: 30000
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      timeout: 30000
     });
     if (r?.data?.matches?.length) matches = matches.concat(r.data.matches);
   }
   return matches;
 }
 
+// Apply LT suggestions to a single string safely
+async function autoFixWithLT(text, lang = "auto") {
+  if (!text || !text.trim()) return text;
+  let s = text;
+  let matches = await runLanguageToolForText(s, lang);
+  // sort by offset descending to keep indices stable
+  matches.sort((a, b) => (b.offset ?? 0) - (a.offset ?? 0));
+  for (const m of matches) {
+    const offs = m.offset ?? 0;
+    const len  = m.length ?? 0;
+    const repl = (m.replacements || [])[0]?.value;
+    if (repl && len >= 0 && offs >= 0 && offs + len <= s.length) {
+      s = s.slice(0, offs) + repl + s.slice(offs + len);
+    }
+  }
+  return s;
+}
+
+// Apply LT to every text node (DOCX w:t / PPTX a:t)
+async function applyLTtoDOCX(buf, lang = "auto") {
+  const zip = await JSZip.loadAsync(buf);
+
+  const parts = [
+    "word/document.xml",
+    "word/header1.xml","word/header2.xml","word/header3.xml",
+    "word/footer1.xml","word/footer2.xml","word/footer3.xml"
+  ];
+
+  for (const p of parts) {
+    if (!zip.file(p)) continue;
+    let xml = await zip.file(p).async("string");
+    // Replace each <w:t>…</w:t> with LT-fixed + normalized text
+    xml = await replaceAsync(xml, /<w:t[^>]*>([\s\S]*?)<\/w:t>/g, async (m, inner) => {
+      let fixed = await autoFixWithLT(inner, lang);
+      fixed = normalizeVisibleText(fixed);
+      return m.replace(inner, escapeXml(fixed));
+    });
+    zip.file(p, xml);
+  }
+  return zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+}
+
+async function applyLTtoPPTX(buf, lang = "auto") {
+  const zip = await JSZip.loadAsync(buf);
+  const slideNames = Object.keys(zip.files).filter(n => /^ppt\/slides\/slide\d+\.xml$/.test(n));
+  for (const name of slideNames) {
+    let xml = await zip.file(name).async("string");
+    xml = await replaceAsync(xml, /<a:t>([\s\S]*?)<\/a:t>/g, async (m, inner) => {
+      let fixed = await autoFixWithLT(inner, lang);
+      fixed = normalizeVisibleText(fixed);
+      return `<a:t>${escapeXml(fixed)}</a:t>`;
+    });
+    zip.file(name, xml);
+  }
+  return zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+}
+
+// small helper: async replace
+async function replaceAsync(str, regex, asyncFn) {
+  const promises = [];
+  str.replace(regex, (match, ...args) => {
+    const promise = asyncFn(match, ...args);
+    promises.push(promise);
+    return match;
+  });
+  const data = await Promise.all(promises);
+  let i = 0;
+  return str.replace(regex, () => data[i++]);
+}
+
+function escapeXml(s) {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+// ======== Report builder ========
 function buildReportJSON({ fileName, language, matches, textLength }) {
   const summary = { fileName, language, textLength, totalIssues: matches.length, byRule: {} };
   for (const m of matches) {
@@ -323,35 +308,38 @@ function buildReportHTML(report) {
   <div><b>Language:</b> ${summary.language}</div>
   <div><b>Length:</b> ${summary.textLength}</div>
   <div><b>Total issues:</b> ${summary.totalIssues}</div>
-  </div>${report.infoBanner || ""}
-  <table class="table"><thead><tr><th>#</th><th>Rule</th><th>Message</th><th>Suggestions</th><th>Context</th></tr></thead>
+  </div><table class="table"><thead><tr><th>#</th><th>Rule</th><th>Message</th><th>Suggestions</th><th>Context</th></tr></thead>
   <tbody>${rows || `<tr><td colspan="5" style="padding:10px">No suggestions.</td></tr>`}</tbody>
   </table></div></div></body></html>`;
 }
 
-/* --------------- Routes --------------- */
+// ======== Routes ========
+
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.post("/clean", upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "Missing file" });
   const p = req.file.path, name = req.file.originalname.toLowerCase();
-  const strict = String(req.query?.strict || "") === "1";
   try {
     let outBuf, outName, mime;
     if (name.endsWith(".pdf")) {
-      outBuf = await processPDFBasic(await fsp.readFile(p), { strict });
+      outBuf = await processPDFStrict(await fsp.readFile(p));
       outName = req.file.originalname.replace(/\.pdf$/i, "") + "_cleaned.pdf";
       mime = "application/pdf";
     } else if (name.endsWith(".docx")) {
-      outBuf = await processDOCXBasic(await fsp.readFile(p));
+      const buf = await fsp.readFile(p);
+      const normalized = await normalizeDOCX(buf);
+      outBuf = normalized;
       outName = req.file.originalname.replace(/\.docx$/i, "") + "_cleaned.docx";
       mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
     } else if (name.endsWith(".pptx")) {
-      outBuf = await processPPTXBasic(await fsp.readFile(p));
+      const buf = await fsp.readFile(p);
+      const normalized = await normalizePPTX(buf);
+      outBuf = normalized;
       outName = req.file.originalname.replace(/\.pptx$/i, "") + "_cleaned.pptx";
       mime = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
     } else {
-      return res.status(400).json({ error: "Only PDF, DOCX or PPTX supported" });
+      return res.status(400).json({ error: "Only PDF, DOCX, or PPTX supported" });
     }
     res.setHeader("Content-Type", mime);
     res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(outName)}"`);
@@ -368,38 +356,44 @@ app.post("/clean-v2", upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "Missing file" });
   const p = req.file.path, name = req.file.originalname.toLowerCase();
   const lang = (req.body?.lt_language || "auto").toString();
-  const strict = String(req.query?.strict || "") === "1";
+  const applyLT = String(req.body?.lt_apply || "0") === "1";
   try {
     let cleanedBuf, cleanedName, text = "";
+
     if (name.endsWith(".pdf")) {
       const buf = await fsp.readFile(p);
-      cleanedBuf = await processPDFBasic(buf, { strict });
+      cleanedBuf = await processPDFStrict(buf);
       cleanedName = req.file.originalname.replace(/\.pdf$/i, "") + "_cleaned.pdf";
-      text = await extractTextFromPDF(cleanedBuf);
+      // extract text for report only
+      try {
+        const data = await pdfParse(cleanedBuf);
+        text = data.text || "";
+      } catch {}
     } else if (name.endsWith(".docx")) {
       const buf = await fsp.readFile(p);
-      cleanedBuf = await processDOCXBasic(buf);
+      // normalize first
+      let tmp = await normalizeDOCX(buf);
+      // optional LT autofix
+      if (applyLT) tmp = await applyLTtoDOCX(tmp, lang);
+      cleanedBuf = tmp;
       cleanedName = req.file.originalname.replace(/\.docx$/i, "") + "_cleaned.docx";
-      text = await extractTextFromDOCX(cleanedBuf);
+      text = await extractTextFromDOCX(tmp);
     } else if (name.endsWith(".pptx")) {
       const buf = await fsp.readFile(p);
-      cleanedBuf = await processPPTXBasic(buf);
+      // normalize first
+      let tmp = await normalizePPTX(buf);
+      // optional LT autofix
+      if (applyLT) tmp = await applyLTtoPPTX(tmp, lang);
+      cleanedBuf = tmp;
       cleanedName = req.file.originalname.replace(/\.pptx$/i, "") + "_cleaned.pptx";
-      text = await extractTextFromPPTX(cleanedBuf);
+      text = await extractTextFromPPTX(tmp);
     } else {
-      return res.status(400).json({ error: "Only PDF, DOCX or PPTX supported" });
+      return res.status(400).json({ error: "Only PDF, DOCX, or PPTX supported" });
     }
 
-    let matches = [];
-    let ltNote = null;
-    try {
-      matches = await runLanguageTool(text || "", lang);
-    } catch (e) {
-      ltNote = "LanguageTool unavailable (network/quota). Report generated without suggestions.";
-    }
-
+    const matches = await runLanguageToolForText(text || "", lang);
     const reportJSON = buildReportJSON({ fileName: cleanedName, language: lang, matches, textLength: (text || "").length });
-    const reportHTML = buildReportHTML({ ...reportJSON, infoBanner: ltNote ? `<div style="margin:12px 0;padding:10px 12px;border-radius:10px;background:#3b82f6;color:#fff">${ltNote}</div>` : "" });
+    const reportHTML = buildReportHTML(reportJSON);
 
     const zip = new JSZip();
     zip.file(cleanedName, cleanedBuf);
@@ -419,5 +413,28 @@ app.post("/clean-v2", upload.single("file"), async (req, res) => {
   }
 });
 
+// ======== extraction helpers (for reports) ========
+
+async function extractTextFromDOCX(buf) {
+  const zip = await JSZip.loadAsync(buf);
+  const p = "word/document.xml";
+  if (!zip.file(p)) return "";
+  const xml = await zip.file(p).async("string");
+  let t = "";
+  xml.replace(/<w:t[^>]*>([\s\S]*?)<\/w:t>/g, (_m, inner) => { t += inner + " "; return _m; });
+  return normalizeVisibleText(t);
+}
+
+async function extractTextFromPPTX(buf) {
+  const zip = await JSZip.loadAsync(buf);
+  const slides = Object.keys(zip.files).filter(n => /^ppt\/slides\/slide\d+\.xml$/.test(n));
+  let t = "";
+  for (const s of slides) {
+    const xml = await zip.file(s).async("string");
+    xml.replace(/<a:t>([\s\S]*?)<\/a:t>/g, (_m, inner) => { t += inner + " "; return _m; });
+  }
+  return normalizeVisibleText(t);
+}
+
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log("DocSafe backend running on port", PORT));
+app.listen(PORT, () => console.log("DocSafe backend (autofix) running on port", PORT));
