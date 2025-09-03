@@ -1,13 +1,10 @@
 /**
- * DocSafe Backend — Beta V2.1 (autofix)
- * V1 (/clean)
- *  - PDF: clear metadata + drop white/invisible text (strict)
- *  - DOCX/PPTX: normalize punctuation/spaces, dedupe punctuation & repeated words, trim, clear metadata
- * V2 (/clean-v2)
- *  - same as V1 + LanguageTool report (ZIP: cleaned + report.json + report.html)
- *  - optional auto-apply LT suggestions on DOCX/PPTX if lt_apply=1
+ * DocSafe Backend — Beta V2 (strict cleaner)
+ * Endpoints:
+ *  - POST /clean     -> retourne le fichier nettoyé (PDF/DOCX/PPTX)
+ *  - POST /clean-v2  -> nettoyé + rapport LanguageTool en ZIP (cleaned + report.json + report.html)
+ *  - GET  /health    -> OK
  */
-
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -26,15 +23,16 @@ const allowed = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map(s => s.trim())
   .filter(Boolean);
-
-app.use(cors({
-  origin(origin, cb) {
-    if (!origin) return cb(null, true);
-    if (allowed.length === 0 || allowed.includes(origin)) return cb(null, true);
-    return cb(new Error("Origin not allowed by CORS"));
-  },
-  credentials: true
-}));
+app.use(
+  cors({
+    origin(origin, cb) {
+      if (!origin) return cb(null, true);
+      if (allowed.length === 0 || allowed.includes(origin)) return cb(null, true);
+      return cb(new Error("Origin not allowed by CORS"));
+    },
+    credentials: true,
+  })
+);
 
 app.use(express.json({ limit: "25mb" }));
 
@@ -42,60 +40,77 @@ app.use(express.json({ limit: "25mb" }));
 const upload = multer({
   storage: multer.diskStorage({
     destination: (req, file, cb) => cb(null, os.tmpdir()),
-    filename: (req, file, cb) => cb(null, Date.now() + "-" + file.originalname.replace(/\s+/g, "_"))
+    filename: (req, file, cb) =>
+      cb(null, Date.now() + "-" + file.originalname.replace(/\s+/g, "_")),
   }),
-  limits: { fileSize: 20 * 1024 * 1024 } // 20 MB
+  limits: { fileSize: 20 * 1024 * 1024 }, // 20 Mo
 });
 
-// -------- LanguageTool --------
-const LT_URL = process.env.LT_API_URL || "https://api.languagetool.org/v2/check";
+// -------- Helpers --------
+const LT_URL =
+  process.env.LT_API_URL || "https://api.languagetool.org/v2/check";
 const LT_KEY = process.env.LT_API_KEY || null;
 
-// ======== TEXT NORMALIZATION (generic) ========
-
-// Remove ZWSP, normalize spaces & punctuation, dedupe punctuation and repeated words
-function normalizeVisibleText(str) {
+/**
+ * Clean text aggressively:
+ * - Collapse duplicate punctuation/symbols (", ; : ! ? . @ # % & * € $")
+ * - Normalize spaces and spacing around punctuation
+ * - Remove repeated consecutive words (case-insensitive)
+ * - Trim lines and collapse excessive blank lines
+ */
+function cleanText(str) {
   if (!str) return str;
-  let s = String(str);
+  let s = String(str).replace(/\r\n?/g, "\n");
 
-  // zero-width + misc spaces → regular space
-  s = s.replace(/[\u200B\u200C\u200D\u2060]/g, "");
-  s = s.replace(/\u00A0/g, " "); // NBSP → space
+  // (1) Collapse duplicate punctuation & symbols
+  s = s.replace(/([,;:!?])(?:\s*\1)+/g, "$1"); // , ; : ! ?
+  // Keep "." strict: any run of dots -> single "."
+  s = s.replace(/\.{2,}/g, ".");
+  s = s.replace(/([@#%&*€$])\1+/g, "$1"); // @ # % & * € $
 
-  // collapse spaces and tidy newlines
-  s = s.replace(/[ \t]+/g, " ");
-  s = s.replace(/ *\n */g, "\n");
+  // (2) Normalize spaces and spacing around punctuation
+  s = s.replace(/[ \t]+/g, " "); // collapse horizontal spaces
+  s = s.replace(/\s+([,;:!?\.])/g, "$1"); // no space before punctuation
+  s = s.replace(/([,;:!?\.])(?![\s)\]\}»”'])/g, "$1 "); // ensure one space after
+  s = s.replace(/[ ]{2,}/g, " "); // cleanup doubles
 
-  // remove spaces before punctuation
-  s = s.replace(/\s+([,;:!?\.])/g, "$1");
-  // ensure one space after punctuation when followed by a word
-  s = s.replace(/([,;:!?\.])(?=\S)/g, "$1 ");
+  // (3) Parentheses / quotes tightening
+  s = s.replace(/\(\s+/g, "(").replace(/\s+\)/g, ")");
+  s = s.replace(/\s+(['”»])/g, "$1").replace(/([«“'])\s+/g, "$1");
 
-  // collapse multiple spaces again
-  s = s.replace(/\s{2,}/g, " ");
+  // (4) Remove consecutive duplicate words (>= 2 chars)
+  s = s.replace(/\b([A-Za-zÀ-ÖØ-öø-ÿ]{2,})\b(\s+\1\b)+/gi, "$1");
 
-  // dedupe repeated punctuation like ",,,", "!!", "??"
-  s = s.replace(/([,;:!?\.])\1+/g, "$1");
+  // (5) Strip leftovers like " ." , " ;" etc.
+  s = s
+    .replace(/ \./g, ".")
+    .replace(/ ,/g, ",")
+    .replace(/ ;/g, ";")
+    .replace(/ :/g, ":")
+    .replace(/ !/g, "!")
+    .replace(/ \?/g, "?");
 
-  // dedupe repeated words (case-insensitive)
-  s = s.replace(/\b(\w+)(\s+\1\b)+/gi, "$1");
+  // (6) Trim lines & collapse excessive blank lines
+  s = s.replace(/^[ \t]+|[ \t]+$/gm, "");
+  s = s.replace(/\n{3,}/g, "\n\n");
 
-  // trim lines and ends
-  s = s.replace(/ *\n */g, "\n").trim();
-
-  return s;
+  return s.trim();
 }
 
-// Apply normalizeVisibleText inside DOCX <w:t>...</w:t>
-async function normalizeDOCX(xmlBuf) {
-  const zip = await JSZip.loadAsync(xmlBuf);
-  // core metadata
+/** ---------- DOCX ---------- */
+async function processDOCXBasic(buf) {
+  const zip = await JSZip.loadAsync(buf);
+
+  // Clean core metadata
   const core = "docProps/core.xml";
   if (zip.file(core)) {
     let xml = await zip.file(core).async("string");
     xml = xml
       .replace(/<dc:creator>.*?<\/dc:creator>/s, "<dc:creator></dc:creator>")
-      .replace(/<cp:lastModifiedBy>.*?<\/cp:lastModifiedBy>/s, "<cp:lastModifiedBy></cp:lastModifiedBy>")
+      .replace(
+        /<cp:lastModifiedBy>.*?<\/cp:lastModifiedBy>/s,
+        "<cp:lastModifiedBy></cp:lastModifiedBy>"
+      )
       .replace(/<dc:title>.*?<\/dc:title>/s, "<dc:title></dc:title>")
       .replace(/<dc:subject>.*?<\/dc:subject>/s, "<dc:subject></dc:subject>")
       .replace(/<cp:keywords>.*?<\/cp:keywords>/s, "<cp:keywords></cp:keywords>");
@@ -103,79 +118,121 @@ async function normalizeDOCX(xmlBuf) {
   }
   if (zip.file("docProps/custom.xml")) zip.remove("docProps/custom.xml");
 
-  // main document
-  const parts = [
-    "word/document.xml",
-    "word/header1.xml","word/header2.xml","word/header3.xml",
-    "word/footer1.xml","word/footer2.xml","word/footer3.xml"
-  ];
-
-  for (const p of parts) {
-    if (!zip.file(p)) continue;
-    let xml = await zip.file(p).async("string");
+  // Clean document text: replace contents of <w:t>
+  const docXml = "word/document.xml";
+  if (zip.file(docXml)) {
+    let xml = await zip.file(docXml).async("string");
     xml = xml.replace(/<w:t[^>]*>([\s\S]*?)<\/w:t>/g, (m, inner) => {
-      const cleaned = normalizeVisibleText(inner);
+      const cleaned = cleanText(inner);
       return m.replace(inner, cleaned);
     });
-    zip.file(p, xml);
+    zip.file(docXml, xml);
   }
-
-  return zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+  return await zip.generateAsync({
+    type: "nodebuffer",
+    compression: "DEFLATE",
+  });
 }
 
-// Apply normalizeVisibleText inside PPTX slides
-async function normalizePPTX(xmlBuf) {
-  const zip = await JSZip.loadAsync(xmlBuf);
+async function extractTextFromDOCX(buf) {
+  const zip = await JSZip.loadAsync(buf);
+  const p = "word/document.xml";
+  if (!zip.file(p)) return "";
+  const xml = await zip.file(p).async("string");
+  let t = "";
+  xml.replace(/<w:t[^>]*>([\s\S]*?)<\/w:t>/g, (_m, inner) => {
+    t += inner + " ";
+    return _m;
+  });
+  return cleanText(t);
+}
 
-  // metadata in ppt/presProps? (PPTX has less personal metadata than DOCX)
-  // We leave metadata focus for DOCX/PDF. (Optional: clear app.xml/core.xml if present)
+/** ---------- PPTX ---------- */
+async function processPPTXBasic(buf) {
+  const zip = await JSZip.loadAsync(buf);
+
+  // Clean core metadata
   const core = "docProps/core.xml";
   if (zip.file(core)) {
     let xml = await zip.file(core).async("string");
     xml = xml
       .replace(/<dc:creator>.*?<\/dc:creator>/s, "<dc:creator></dc:creator>")
-      .replace(/<cp:lastModifiedBy>.*?<\/cp:lastModifiedBy>/s, "<cp:lastModifiedBy></cp:lastModifiedBy>")
-      .replace(/<dc:title>.*?<\/dc:title>/s, "<dc:title></dc:title>")
-      .replace(/<dc:subject>.*?<\/dc:subject>/s, "<dc:subject></dc:subject>");
+      .replace(
+        /<cp:lastModifiedBy>.*?<\/cp:lastModifiedBy>/s,
+        "<cp:lastModifiedBy></cp:lastModifiedBy>"
+      )
+      .replace(/<dc:title>.*?<\/dc:title>/s, "<dc:title></dc:title>");
     zip.file(core, xml);
   }
+  if (zip.file("docProps/custom.xml")) zip.remove("docProps/custom.xml");
 
-  // iterate slides
-  const slideNames = Object.keys(zip.files).filter(n => /^ppt\/slides\/slide\d+\.xml$/.test(n));
-  for (const name of slideNames) {
-    let xml = await zip.file(name).async("string");
-    // text runs are <a:t>...</a:t>
-    xml = xml.replace(/<a:t>([\s\S]*?)<\/a:t>/g, (m, inner) => {
-      const cleaned = normalizeVisibleText(inner);
-      return `<a:t>${cleaned}</a:t>`;
-    });
-    zip.file(name, xml);
+  // Clean slides text: replace contents of <a:t> on all slides
+  const folder = zip.folder("ppt/slides");
+  if (folder) {
+    const files = Object.keys(folder.files).filter((n) => /slide\d+\.xml$/.test(n));
+    for (const name of files) {
+      let xml = await zip.file(`ppt/slides/${name}`).async("string");
+      xml = xml.replace(/<a:t>([\s\S]*?)<\/a:t>/g, (m, inner) => {
+        const cleaned = cleanText(inner);
+        return m.replace(inner, cleaned);
+      });
+      zip.file(`ppt/slides/${name}`, xml);
+    }
   }
 
-  return zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+  return await zip.generateAsync({
+    type: "nodebuffer",
+    compression: "DEFLATE",
+  });
 }
 
-// ======== PDF helpers ========
+async function extractTextFromPPTX(buf) {
+  const zip = await JSZip.loadAsync(buf);
+  const folder = zip.folder("ppt/slides");
+  if (!folder) return "";
+  const files = Object.keys(folder.files).filter((n) => /slide\d+\.xml$/.test(n));
+  let all = "";
+  for (const name of files) {
+    const xml = await zip.file(`ppt/slides/${name}`).async("string");
+    xml.replace(/<a:t>([\s\S]*?)<\/a:t>/g, (_m, inner) => {
+      all += inner + " ";
+      return _m;
+    });
+  }
+  return cleanText(all);
+}
 
-async function processPDFStrict(buf) {
+/** ---------- PDF ---------- */
+async function processPDFBasic(buf) {
+  // Clear metadata (content streams are not rewritten)
   const pdf = await PDFDocument.load(buf, { updateMetadata: true });
-  // wipe metadata
-  pdf.setTitle(""); pdf.setAuthor(""); pdf.setSubject("");
-  pdf.setKeywords([]); pdf.setProducer(""); pdf.setCreator("");
+  pdf.setTitle("");
+  pdf.setAuthor("");
+  pdf.setSubject("");
+  pdf.setKeywords([]);
+  pdf.setProducer("");
+  pdf.setCreator("");
   const epoch = new Date(0);
-  pdf.setCreationDate(epoch); pdf.setModificationDate(epoch);
-
-  // NOTE: removing white/invisible text fully is non-trivial without parsing content streams.
-  // We keep the safe path (metadata + any hidden reader-level content), then save.
+  pdf.setCreationDate(epoch);
+  pdf.setModificationDate(epoch);
   const out = await pdf.save();
   return Buffer.from(out);
 }
 
-// ======== LT helpers ========
+async function extractTextFromPDF(buf) {
+  try {
+    const data = await pdfParse(buf);
+    return cleanText(data.text || "");
+  } catch {
+    return "";
+  }
+}
 
-async function runLanguageToolForText(text, lang = "auto") {
+/** ---------- LanguageTool & Report ---------- */
+async function runLanguageTool(fullText, lang = "auto") {
   const chunks = [];
-  for (let i = 0; i < text.length; i += 20000) chunks.push(text.slice(i, i + 20000));
+  for (let i = 0; i < fullText.length; i += 20000)
+    chunks.push(fullText.slice(i, i + 20000));
   let matches = [];
   for (const chunk of chunks) {
     if (!chunk.trim()) continue;
@@ -185,93 +242,21 @@ async function runLanguageToolForText(text, lang = "auto") {
     if (LT_KEY) form.set("apiKey", LT_KEY);
     const r = await axios.post(LT_URL, form.toString(), {
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      timeout: 30000
+      timeout: 30000,
     });
     if (r?.data?.matches?.length) matches = matches.concat(r.data.matches);
   }
   return matches;
 }
 
-// Apply LT suggestions to a single string safely
-async function autoFixWithLT(text, lang = "auto") {
-  if (!text || !text.trim()) return text;
-  let s = text;
-  let matches = await runLanguageToolForText(s, lang);
-  // sort by offset descending to keep indices stable
-  matches.sort((a, b) => (b.offset ?? 0) - (a.offset ?? 0));
-  for (const m of matches) {
-    const offs = m.offset ?? 0;
-    const len  = m.length ?? 0;
-    const repl = (m.replacements || [])[0]?.value;
-    if (repl && len >= 0 && offs >= 0 && offs + len <= s.length) {
-      s = s.slice(0, offs) + repl + s.slice(offs + len);
-    }
-  }
-  return s;
-}
-
-// Apply LT to every text node (DOCX w:t / PPTX a:t)
-async function applyLTtoDOCX(buf, lang = "auto") {
-  const zip = await JSZip.loadAsync(buf);
-
-  const parts = [
-    "word/document.xml",
-    "word/header1.xml","word/header2.xml","word/header3.xml",
-    "word/footer1.xml","word/footer2.xml","word/footer3.xml"
-  ];
-
-  for (const p of parts) {
-    if (!zip.file(p)) continue;
-    let xml = await zip.file(p).async("string");
-    // Replace each <w:t>…</w:t> with LT-fixed + normalized text
-    xml = await replaceAsync(xml, /<w:t[^>]*>([\s\S]*?)<\/w:t>/g, async (m, inner) => {
-      let fixed = await autoFixWithLT(inner, lang);
-      fixed = normalizeVisibleText(fixed);
-      return m.replace(inner, escapeXml(fixed));
-    });
-    zip.file(p, xml);
-  }
-  return zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
-}
-
-async function applyLTtoPPTX(buf, lang = "auto") {
-  const zip = await JSZip.loadAsync(buf);
-  const slideNames = Object.keys(zip.files).filter(n => /^ppt\/slides\/slide\d+\.xml$/.test(n));
-  for (const name of slideNames) {
-    let xml = await zip.file(name).async("string");
-    xml = await replaceAsync(xml, /<a:t>([\s\S]*?)<\/a:t>/g, async (m, inner) => {
-      let fixed = await autoFixWithLT(inner, lang);
-      fixed = normalizeVisibleText(fixed);
-      return `<a:t>${escapeXml(fixed)}</a:t>`;
-    });
-    zip.file(name, xml);
-  }
-  return zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
-}
-
-// small helper: async replace
-async function replaceAsync(str, regex, asyncFn) {
-  const promises = [];
-  str.replace(regex, (match, ...args) => {
-    const promise = asyncFn(match, ...args);
-    promises.push(promise);
-    return match;
-  });
-  const data = await Promise.all(promises);
-  let i = 0;
-  return str.replace(regex, () => data[i++]);
-}
-
-function escapeXml(s) {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-// ======== Report builder ========
 function buildReportJSON({ fileName, language, matches, textLength }) {
-  const summary = { fileName, language, textLength, totalIssues: matches.length, byRule: {} };
+  const summary = {
+    fileName,
+    language,
+    textLength,
+    totalIssues: matches.length,
+    byRule: {},
+  };
   for (const m of matches) {
     const k = m.rule?.id || "GENERIC";
     summary.byRule[k] = (summary.byRule[k] || 0) + 1;
@@ -281,17 +266,22 @@ function buildReportJSON({ fileName, language, matches, textLength }) {
 
 function buildReportHTML(report) {
   const { summary, matches } = report;
-  const rows = matches.map((m, i) => {
-    const repl = (m.replacements || []).slice(0, 3).map(r => r.value).join(", ");
-    const ctx = (m.context?.text || "").replace(/</g, "&lt;");
-    return `<tr>
+  const rows = matches
+    .map((m, i) => {
+      const repl = (m.replacements || [])
+        .slice(0, 3)
+        .map((r) => r.value)
+        .join(", ");
+      const ctx = (m.context?.text || "").replace(/</g, "&lt;");
+      return `<tr>
       <td style="padding:8px;border-bottom:1px solid #e5e7eb;">${i + 1}</td>
       <td style="padding:8px;border-bottom:1px solid #e5e7eb;">${m.rule?.id || ""}</td>
-      <td style="padding:8px;border-bottom:1px solid #e5e7eb;">${(m.message || "").replace(/</g,"&lt;")}</td>
+      <td style="padding:8px;border-bottom:1px solid #e5e7eb;">${(m.message || "").replace(/</g, "&lt;")}</td>
       <td style="padding:8px;border-bottom:1px solid #e5e7eb;">${repl || "-"}</td>
       <td style="padding:8px;border-bottom:1px solid #e5e7eb;">${ctx}</td>
     </tr>`;
-  }).join("");
+    })
+    .join("");
   return `<!doctype html><html><head><meta charset="utf-8"><title>DocSafe Report</title>
   <meta name="viewport" content="width=device-width,initial-scale=1"><style>
   body{font-family:system-ui,Segoe UI,Roboto,Ubuntu,sans-serif;background:#0f172a;color:#e5e7eb;margin:0;padding:24px}
@@ -313,36 +303,41 @@ function buildReportHTML(report) {
   </table></div></div></body></html>`;
 }
 
-// ======== Routes ========
-
+// -------- Routes --------
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.post("/clean", upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "Missing file" });
-  const p = req.file.path, name = req.file.originalname.toLowerCase();
+  const p = req.file.path,
+    name = req.file.originalname.toLowerCase();
   try {
-    let outBuf, outName, mime;
+    let outBuf,
+      outName,
+      mime;
     if (name.endsWith(".pdf")) {
-      outBuf = await processPDFStrict(await fsp.readFile(p));
+      outBuf = await processPDFBasic(await fsp.readFile(p));
       outName = req.file.originalname.replace(/\.pdf$/i, "") + "_cleaned.pdf";
       mime = "application/pdf";
     } else if (name.endsWith(".docx")) {
-      const buf = await fsp.readFile(p);
-      const normalized = await normalizeDOCX(buf);
-      outBuf = normalized;
-      outName = req.file.originalname.replace(/\.docx$/i, "") + "_cleaned.docx";
-      mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+      outBuf = await processDOCXBasic(await fsp.readFile(p));
+      outName =
+        req.file.originalname.replace(/\.docx$/i, "") + "_cleaned.docx";
+      mime =
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
     } else if (name.endsWith(".pptx")) {
-      const buf = await fsp.readFile(p);
-      const normalized = await normalizePPTX(buf);
-      outBuf = normalized;
-      outName = req.file.originalname.replace(/\.pptx$/i, "") + "_cleaned.pptx";
-      mime = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+      outBuf = await processPPTXBasic(await fsp.readFile(p));
+      outName =
+        req.file.originalname.replace(/\.pptx$/i, "") + "_cleaned.pptx";
+      mime =
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation";
     } else {
-      return res.status(400).json({ error: "Only PDF, DOCX, or PPTX supported" });
+      return res.status(400).json({ error: "Only PDF, DOCX or PPTX supported" });
     }
     res.setHeader("Content-Type", mime);
-    res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(outName)}"`);
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${encodeURIComponent(outName)}"`
+    );
     res.send(outBuf);
   } catch (e) {
     console.error("CLEAN error:", e);
@@ -354,45 +349,42 @@ app.post("/clean", upload.single("file"), async (req, res) => {
 
 app.post("/clean-v2", upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "Missing file" });
-  const p = req.file.path, name = req.file.originalname.toLowerCase();
+  const p = req.file.path,
+    name = req.file.originalname.toLowerCase();
   const lang = (req.body?.lt_language || "auto").toString();
-  const applyLT = String(req.body?.lt_apply || "0") === "1";
   try {
-    let cleanedBuf, cleanedName, text = "";
-
+    let cleanedBuf,
+      cleanedName,
+      text = "";
     if (name.endsWith(".pdf")) {
       const buf = await fsp.readFile(p);
-      cleanedBuf = await processPDFStrict(buf);
-      cleanedName = req.file.originalname.replace(/\.pdf$/i, "") + "_cleaned.pdf";
-      // extract text for report only
-      try {
-        const data = await pdfParse(cleanedBuf);
-        text = data.text || "";
-      } catch {}
+      cleanedBuf = await processPDFBasic(buf);
+      cleanedName =
+        req.file.originalname.replace(/\.pdf$/i, "") + "_cleaned.pdf";
+      text = await extractTextFromPDF(cleanedBuf);
     } else if (name.endsWith(".docx")) {
       const buf = await fsp.readFile(p);
-      // normalize first
-      let tmp = await normalizeDOCX(buf);
-      // optional LT autofix
-      if (applyLT) tmp = await applyLTtoDOCX(tmp, lang);
-      cleanedBuf = tmp;
-      cleanedName = req.file.originalname.replace(/\.docx$/i, "") + "_cleaned.docx";
-      text = await extractTextFromDOCX(tmp);
+      cleanedBuf = await processDOCXBasic(buf);
+      cleanedName =
+        req.file.originalname.replace(/\.docx$/i, "") + "_cleaned.docx";
+      text = await extractTextFromDOCX(cleanedBuf);
     } else if (name.endsWith(".pptx")) {
       const buf = await fsp.readFile(p);
-      // normalize first
-      let tmp = await normalizePPTX(buf);
-      // optional LT autofix
-      if (applyLT) tmp = await applyLTtoPPTX(tmp, lang);
-      cleanedBuf = tmp;
-      cleanedName = req.file.originalname.replace(/\.pptx$/i, "") + "_cleaned.pptx";
-      text = await extractTextFromPPTX(tmp);
+      cleanedBuf = await processPPTXBasic(buf);
+      cleanedName =
+        req.file.originalname.replace(/\.pptx$/i, "") + "_cleaned.pptx";
+      text = await extractTextFromPPTX(cleanedBuf);
     } else {
-      return res.status(400).json({ error: "Only PDF, DOCX, or PPTX supported" });
+      return res.status(400).json({ error: "Only PDF, DOCX or PPTX supported" });
     }
 
-    const matches = await runLanguageToolForText(text || "", lang);
-    const reportJSON = buildReportJSON({ fileName: cleanedName, language: lang, matches, textLength: (text || "").length });
+    const matches = await runLanguageTool(text || "", lang);
+    const reportJSON = buildReportJSON({
+      fileName: cleanedName,
+      language: lang,
+      matches,
+      textLength: (text || "").length,
+    });
     const reportHTML = buildReportHTML(reportJSON);
 
     const zip = new JSZip();
@@ -400,10 +392,16 @@ app.post("/clean-v2", upload.single("file"), async (req, res) => {
     zip.file("report.json", JSON.stringify(reportJSON, null, 2));
     zip.file("report.html", reportHTML);
 
-    const zipBuf = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+    const zipBuf = await zip.generateAsync({
+      type: "nodebuffer",
+      compression: "DEFLATE",
+    });
     const zipName = req.file.originalname.replace(/\.(pdf|docx|pptx)$/i, "") + "_docsafe_report.zip";
     res.setHeader("Content-Type", "application/zip");
-    res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(zipName)}"`);
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${encodeURIComponent(zipName)}"`
+    );
     res.send(zipBuf);
   } catch (e) {
     console.error("CLEAN-V2 error:", e?.response?.data || e);
@@ -413,28 +411,6 @@ app.post("/clean-v2", upload.single("file"), async (req, res) => {
   }
 });
 
-// ======== extraction helpers (for reports) ========
-
-async function extractTextFromDOCX(buf) {
-  const zip = await JSZip.loadAsync(buf);
-  const p = "word/document.xml";
-  if (!zip.file(p)) return "";
-  const xml = await zip.file(p).async("string");
-  let t = "";
-  xml.replace(/<w:t[^>]*>([\s\S]*?)<\/w:t>/g, (_m, inner) => { t += inner + " "; return _m; });
-  return normalizeVisibleText(t);
-}
-
-async function extractTextFromPPTX(buf) {
-  const zip = await JSZip.loadAsync(buf);
-  const slides = Object.keys(zip.files).filter(n => /^ppt\/slides\/slide\d+\.xml$/.test(n));
-  let t = "";
-  for (const s of slides) {
-    const xml = await zip.file(s).async("string");
-    xml.replace(/<a:t>([\s\S]*?)<\/a:t>/g, (_m, inner) => { t += inner + " "; return _m; });
-  }
-  return normalizeVisibleText(t);
-}
-
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log("DocSafe backend (autofix) running on port", PORT));
+app.listen(PORT, () => console.log("DocSafe backend running on port", PORT));
+
