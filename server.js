@@ -1,11 +1,9 @@
-// server.js
 import express from 'express';
 import cors from 'cors';
 import compression from 'compression';
 import multer from 'multer';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { v4 as uuidv4 } from 'uuid';
 
 import { detectMime, zipOutput, inferExt } from './lib/file.js';
 import { normalizeText } from './lib/textCleaner.js';
@@ -14,7 +12,8 @@ import { ltCheck } from './lib/languagetool.js';
 import { cleanPDF } from './lib/pdfCleaner.js';
 import { cleanDOCX } from './lib/docxCleaner.js';
 import { cleanPPTX } from './lib/pptxCleaner.js';
-import { aiRephrase } from './lib/ai.js';
+import { aiProofread, aiRephrase } from './lib/ai.js';
+import { createDocxFromText } from './lib/docxWriter.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -29,9 +28,12 @@ app.get('/health', (_req, res) => {
   res.json({ ok: true, message: 'Backend is running ✅' });
 });
 
-// ----- core pipeline -----
-async function processFile({ buffer, filename, strictPdf = false, doAI = false }) {
-  const id = uuidv4();
+/**
+ * mode:
+ *  - 'v1' => nettoyage + orthographe IA (sans reformulation)
+ *  - 'v2' => v1 + reformulation IA
+ */
+async function processFile({ buffer, filename, strictPdf = false, mode = 'v1' }) {
   const mime = await detectMime(buffer, filename);
   const ext = inferExt(filename, mime);
 
@@ -42,50 +44,69 @@ async function processFile({ buffer, filename, strictPdf = false, doAI = false }
   if (mime === 'application/pdf' || ext === '.pdf') {
     const { outBuffer, text } = await cleanPDF(buffer, { strict: strictPdf });
     cleanedBuffer = outBuffer; extractedText = text || '';
-  } else if (
-    mime === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' ||
-    ext === '.docx'
-  ) {
+  } else if (mime === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || ext === '.docx') {
     const { outBuffer, text } = await cleanDOCX(buffer);
     cleanedBuffer = outBuffer; extractedText = text || '';
-  } else if (
-    mime === 'application/vnd.openxmlformats-officedocument.presentationml.presentation' ||
-    ext === '.pptx'
-  ) {
+  } else if (mime === 'application/vnd.openxmlformats-officedocument.presentationml.presentation' || ext === '.pptx') {
     const { outBuffer, text } = await cleanPPTX(buffer);
     cleanedBuffer = outBuffer; extractedText = text || '';
   } else {
     throw new Error('Format non supporté. Utilisez PDF/DOCX/PPTX.');
   }
 
+  // Normalisation mécanique (espaces/ponctuation)
   const normalized = normalizeText(extractedText);
 
+  // LanguageTool (optionnel)
   if (process.env.LT_ENDPOINT) {
     try { ltResult = await ltCheck(normalized); } catch { ltResult = null; }
   }
 
-  let aiText = null;
-  if (doAI) {
-    try { aiText = await aiRephrase(normalized); } catch { aiText = null; }
+  // --- IA ---
+  let proofText = null;
+  let rephraseText = null;
+
+  // V1: correction IA (sans reformulation)
+  try { proofText = await aiProofread(normalized); } catch { proofText = null; }
+
+  // V2: reformulation en plus
+  if (mode === 'v2') {
+    const baseForRephrase = proofText || normalized;
+    try { rephraseText = await aiRephrase(baseForRephrase); } catch { rephraseText = null; }
   }
 
+  // --- Sorties ZIP ---
+  const files = [];
+
+  // 1) Fichier nettoyé + orthographe IA => DOCX propre
+  if (proofText) {
+    const docx = await createDocxFromText(proofText, { title: 'DocSafe Cleaned (V1)' });
+    files.push({ name: 'cleaned.docx', data: docx });
+  } else {
+    // fallback: renvoyer au moins le binaire nettoyé
+    files.push({ name: `cleaned${ext}`, data: cleanedBuffer });
+  }
+
+  // 2) V2: fichier reformulé
+  if (mode === 'v2' && rephraseText) {
+    const reDocx = await createDocxFromText(rephraseText, { title: 'DocSafe Rephrased (V2)' });
+    files.push({ name: 'rephrased.docx', data: reDocx });
+  }
+
+  // 3) Report
   const reportHtml = generateReportHTML({
     filename,
     mime,
     baseStats: { length: (normalized || '').length },
     lt: ltResult,
-    ai: aiText ? { applied: true } : { applied: false },
+    ai: { applied: true, mode }
   });
+  files.push({ name: 'report.html', data: Buffer.from(reportHtml, 'utf-8') });
 
-  const files = [
-    { name: `cleaned${ext}`, data: cleanedBuffer },
-    { name: 'report.html', data: Buffer.from(reportHtml, 'utf-8') },
-  ];
   const zipBuffer = await zipOutput(files);
   return zipBuffer;
 }
 
-// ----- routes -----
 app.post('/clean', upload.single('file'), async (req, res) => {
   try {
     const strictPdf = req.body?.strictPdf === 'true';
@@ -93,7 +114,7 @@ app.post('/clean', upload.single('file'), async (req, res) => {
       buffer: req.file.buffer,
       filename: req.file.originalname,
       strictPdf,
-      doAI: false
+      mode: 'v1'
     });
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader('Content-Disposition', 'attachment; filename="docsafe-v1.zip"');
@@ -111,7 +132,7 @@ app.post('/clean-v2', upload.single('file'), async (req, res) => {
       buffer: req.file.buffer,
       filename: req.file.originalname,
       strictPdf,
-      doAI: true
+      mode: 'v2'
     });
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader('Content-Disposition', 'attachment; filename="docsafe-v2.zip"');
@@ -121,6 +142,10 @@ app.post('/clean-v2', upload.single('file'), async (req, res) => {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
+
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`DocSafe backend running on :${PORT}`));
+
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`DocSafe backend running on :${PORT}`));
