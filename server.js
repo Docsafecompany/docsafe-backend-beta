@@ -1,4 +1,3 @@
-// server.js
 import express from 'express';
 import cors from 'cors';
 import compression from 'compression';
@@ -61,10 +60,10 @@ async function processFile({ buffer, filename, strictPdf = false, mode = 'v1' })
     throw new Error('Format non supporté. Utilisez PDF/DOCX/PPTX.');
   }
 
-  // Normalisation mécanique (espaces/ponctuation)
+  // Normalisation mécanique
   const normalized = normalizeText(extractedText);
 
-  // LanguageTool (optionnel)
+  // LanguageTool optionnel
   if (process.env.LT_ENDPOINT) {
     try { ltResult = await ltCheck(normalized); } catch { ltResult = null; }
   }
@@ -73,7 +72,7 @@ async function processFile({ buffer, filename, strictPdf = false, mode = 'v1' })
   let proofText = null;
   let rephraseText = null;
 
-  // V1: correction IA (sans reformulation)
+  // V1: correction IA (= orthographe/espaces sans reformulation)
   try { proofText = await aiProofread(normalized); } catch { proofText = null; }
 
   // V2: reformulation en plus
@@ -85,7 +84,7 @@ async function processFile({ buffer, filename, strictPdf = false, mode = 'v1' })
   // --- Sorties ZIP ---
   const files = [];
 
-  // 1) Fichier nettoyé + orthographe IA => DOCX propre
+  // 1) V1: cleaned.docx depuis le texte corrigé par IA (si dispo)
   if (proofText) {
     const docx = await createDocxFromText(proofText, { title: 'DocSafe Cleaned (V1)' });
     files.push({ name: 'cleaned.docx', data: docx });
@@ -94,7 +93,7 @@ async function processFile({ buffer, filename, strictPdf = false, mode = 'v1' })
     files.push({ name: `cleaned${ext}`, data: cleanedBuffer });
   }
 
-  // 2) V2: fichier reformulé
+  // 2) V2: rephrased.docx
   if (mode === 'v2' && rephraseText) {
     const reDocx = await createDocxFromText(rephraseText, { title: 'DocSafe Rephrased (V2)' });
     files.push({ name: 'rephrased.docx', data: reDocx });
@@ -114,6 +113,7 @@ async function processFile({ buffer, filename, strictPdf = false, mode = 'v1' })
   return zipBuffer;
 }
 
+// --- Routes principales ---
 app.post('/clean', upload.single('file'), async (req, res) => {
   try {
     const strictPdf = req.body?.strictPdf === 'true';
@@ -150,6 +150,27 @@ app.post('/clean-v2', upload.single('file'), async (req, res) => {
   }
 });
 
-// === single declaration (pas de doublon) ===
+// --- Routes DIAG (retire-les quand OK) ---
+app.get('/_ai_echo', async (_req, res) => {
+  try {
+    const sample = 'soc ial enablin g commu nication, dis   connection.';
+    const proof = await aiProofread(sample);
+    res.json({ ok: true, in: sample, proof });
+  } catch (e) {
+    res.status(500).json({ ok: false, where: '_ai_echo', error: String(e.message || e) });
+  }
+});
+
+app.post('/_diag_docx', upload.single('file'), async (req, res) => {
+  try {
+    const { outBuffer, text } = await cleanDOCX(req.file.buffer);
+    res.json({ ok: true, extractedLen: (text||'').length, head: (text||'').slice(0,120) });
+  } catch (e) {
+    res.status(500).json({ ok: false, where: '_diag_docx', error: String(e.message || e) });
+  }
+});
+
+// Single listen
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`DocSafe backend running on :${PORT}`));
+
