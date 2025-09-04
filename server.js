@@ -1,3 +1,4 @@
+// server.js
 import express from 'express';
 import cors from 'cors';
 import compression from 'compression';
@@ -44,10 +45,16 @@ async function processFile({ buffer, filename, strictPdf = false, mode = 'v1' })
   if (mime === 'application/pdf' || ext === '.pdf') {
     const { outBuffer, text } = await cleanPDF(buffer, { strict: strictPdf });
     cleanedBuffer = outBuffer; extractedText = text || '';
-  } else if (mime === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || ext === '.docx') {
+  } else if (
+    mime === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' ||
+    ext === '.docx'
+  ) {
     const { outBuffer, text } = await cleanDOCX(buffer);
     cleanedBuffer = outBuffer; extractedText = text || '';
-  } else if (mime === 'application/vnd.openxmlformats-officedocument.presentationml.presentation' || ext === '.pptx') {
+  } else if (
+    mime === 'application/vnd.openxmlformats-officedocument.presentationml.presentation' ||
+    ext === '.pptx'
+  ) {
     const { outBuffer, text } = await cleanPPTX(buffer);
     cleanedBuffer = outBuffer; extractedText = text || '';
   } else {
@@ -143,9 +150,6 @@ app.post('/clean-v2', upload.single('file'), async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`DocSafe backend running on :${PORT}`));
-
-
+// === single declaration (pas de doublon) ===
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`DocSafe backend running on :${PORT}`));
