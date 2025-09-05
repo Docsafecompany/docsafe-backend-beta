@@ -1,4 +1,4 @@
-/* server.js (MAJ V2 = rephrased + report uniquement) */
+/* server.js (REPORT avec stats + exemples diff) */
 const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
@@ -15,23 +15,16 @@ const { createDocxFromText } = require("./lib/docxWriter");
 const app = express();
 app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true, limit: "25mb" }));
-
-app.use(
-  cors({
-    origin: "*",
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Accept"],
-  })
-);
-
+app.use(cors({ origin: "*", methods: ["GET","POST","OPTIONS"], allowedHeaders: ["Content-Type","Accept"] }));
 const upload = multer({ storage: multer.memoryStorage() });
 
+/* ------------------------------- Utils ------------------------------- */
 function normalizeText(input) {
   if (!input) return "";
-  let text = input.replace(/[\u200B-\u200D\uFEFF\u2060\u00AD]/g, "");
+  let text = input.replace(/[\u200B-\u200D\uFEFF\u2060\u00AD]/g, ""); // invisibles
   text = text.replace(/\r\n/g, "\n");
   text = text.replace(/[ \t]{2,}/g, " ");
-  for (const p of [",", ";", ":", "!", "\\?", "@"]) {
+  for (const p of [",",";",";",":","!","\\?","@"]) {
     const re = new RegExp(`(${p})\\s*\\1+`, "g");
     text = text.replace(re, "$1");
   }
@@ -50,7 +43,8 @@ function aiSpellGrammarPass(input) {
   t = t.replace(/\brecieve\b/gi, "receive");
   t = t.replace(/\boccured\b/gi, "occurred");
   t = t.replace(/\bca va\b/gi, "ça va");
-  t = t.replace(/(^|\.\s+|\?\s+|!\s+)([a-zà-öø-ÿ])/g, (m, p1, p2) => p1 + p2.toUpperCase());
+  // sentences capitalized
+  t = t.replace(/(^|\.\s+|\?\s+|!\s+)([a-zà-öø-ÿ])/g, (m,p1,p2)=> p1 + p2.toUpperCase());
   return t;
 }
 
@@ -66,9 +60,8 @@ function aiRephrase(input) {
   return t;
 }
 
-async function extractTextFromFile(fileBuffer, originalName, strictPdf = false) {
+async function extractTextFromFile(fileBuffer, originalName, strictPdf=false) {
   const ext = path.extname(originalName || "").toLowerCase();
-
   if (ext === ".docx") {
     const { value } = await mammoth.extractRawText({ buffer: fileBuffer });
     return value || "";
@@ -88,11 +81,11 @@ async function extractTextFromFile(fileBuffer, originalName, strictPdf = false) 
   if (ext === ".pptx") {
     const zip = await JSZip.loadAsync(fileBuffer);
     const slideFiles = Object.keys(zip.files).filter((f) => /^ppt\/slides\/slide\d+\.xml$/i.test(f));
-    slideFiles.sort((a, b) => parseInt(a.match(/slide(\d+)\.xml/i)[1], 10) - parseInt(b.match(/slide(\d+)\.xml/i)[1], 10));
+    slideFiles.sort((a,b)=> parseInt(a.match(/slide(\d+)\.xml/i)[1],10)-parseInt(b.match(/slide(\d+)\.xml/i)[1],10));
     let all = [];
     for (const f of slideFiles) {
       const xml = await zip.files[f].async("string");
-      const texts = Array.from(xml.matchAll(/<a:t[^>]*>([\s\S]*?)<\/a:t>/gi)).map((m) => m[1]);
+      const texts = Array.from(xml.matchAll(/<a:t[^>]*>([\s\S]*?)<\/a:t>/gi)).map((m)=>m[1]);
       if (texts.length) all.push(texts.join(" "));
     }
     return all.join("\n\n");
@@ -100,134 +93,313 @@ async function extractTextFromFile(fileBuffer, originalName, strictPdf = false) 
   return fileBuffer.toString("utf8");
 }
 
-function buildReportHtml({ originalName, lengthBefore, lengthAfter, notes }) {
-  return `<!doctype html>
-<html lang="fr"><head><meta charset="utf-8"/>
-<title>DocSafe — Rapport</title>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;padding:24px;line-height:1.6}
-h1{font-size:20px;margin:0 0 16px}.kv{margin:8px 0}code{background:#f5f5f5;padding:2px 6px;border-radius:4px}.muted{color:#666}</style>
-</head><body>
-  <h1>DocSafe — Rapport de nettoyage</h1>
-  <div class="kv"><strong>Fichier :</strong> ${originalName || "(sans nom)"}</div>
-  <div class="kv"><strong>Caractères (avant) :</strong> ${lengthBefore}</div>
-  <div class="kv"><strong>Caractères (après) :</strong> ${lengthAfter}</div>
-  <div class="kv"><strong>Gain :</strong> ${Math.max(0, lengthBefore - lengthAfter)}</div>
-  <hr/>
-  <h2>Détails</h2>
-  <ul class="muted">
-    <li>Normalisation espaces/ponctuation (doublons supprimés).</li>
-    <li>Correction orthographe/grammaire basique (IA locale).</li>
-    <li>${notes?.strictPdf ? "Mode strictPdf actif (PDF nettoyé plus agressivement)." : "Mode strictPdf inactif."}</li>
-  </ul>
-</body></html>`;
+function countMatches(str, re) {
+  const m = str.match(re);
+  return m ? m.length : 0;
 }
 
-function tmpPath(name) {
-  return path.join(os.tmpdir(), `${Date.now()}_${name}`);
+function computeCleanStats(original, cleaned, lengthBefore, lengthAfter) {
+  return {
+    zeroWidthRemoved: countMatches(original, /[\u200B-\u200D\uFEFF\u2060\u00AD]/g),
+    doubleSpaceRuns: countMatches(original, /[ \t]{2,}/g),
+    duplicatePunct: {
+      ",": countMatches(original, /(,)\s*\1+/g),
+      ";": countMatches(original, /(;)\s*\1+/g),
+      ":": countMatches(original, /(:)\s*\1+/g),
+      "!": countMatches(original, /(!)\s*\1+/g),
+      "?": countMatches(original, /(\?)\s*\1+/g),
+      "@": countMatches(original, /(@)\s*\1+/g),
+    },
+    spacesBeforePunct: countMatches(original, /\s+([,;:!?])/g),
+    missingSpaceAfterPunct: countMatches(original, /([,;:!?])([^\s\d])/g),
+    collapsedBlankLines: countMatches(original, /\n{3,}/g),
+    sentenceCapitalized: countMatches(original, /(^|\.\s+|\?\s+|!\s+)([a-zà-öø-ÿ])/g),
+    lengthBefore,
+    lengthAfter,
+    charsDelta: lengthAfter - lengthBefore
+  };
 }
 
-async function zipFiles(files) {
-  return new Promise((resolve, reject) => {
+function splitSentences(text) {
+  if (!text) return [];
+  const paras = text.split(/\n{2,}/g);
+  const out = [];
+  for (const p of paras) {
+    const parts = p.split(/(?<=[\.!\?])\s+/);
+    if (parts.length > 1) out.push(...parts);
+    else out.push(p);
+  }
+  return out.map(s => s.trim()).filter(Boolean);
+}
+
+/** Simple LCS diff -> ops: {type:'eq'|'del'|'ins', text} */
+function diffTokens(a, b) {
+  const tok = s => (s.match(/\w+|[^\s\w]+|\s+/g) || []);
+  const A = tok(a), B = tok(b);
+  const n = A.length, m = B.length;
+  const dp = Array.from({length:n+1},()=>Array(m+1).fill(0));
+  for (let i=1;i<=n;i++) {
+    for (let j=1;j<=m;j++) {
+      dp[i][j] = A[i-1] === B[j-1] ? dp[i-1][j-1]+1 : Math.max(dp[i-1][j], dp[i][j-1]);
+    }
+  }
+  const ops = [];
+  let i=n, j=m;
+  while (i>0 || j>0) {
+    if (i>0 && j>0 && A[i-1] === B[j-1]) { ops.push({type:"eq", text:A[i-1]}); i--; j--; }
+    else if (j>0 && (i===0 || dp[i][j-1] >= dp[i-1]?.[j])) { ops.push({type:"ins", text:B[j-1]}); j--; }
+    else { ops.push({type:"del", text:A[i-1]}); i--; }
+  }
+  return ops.reverse();
+}
+function htmlEscape(s){ return s.replace(/[&<>"]/g, c=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c])); }
+
+function renderSideBySide(before, after) {
+  const ops = diffTokens(before, after);
+  // Before: show eq + del
+  const left = ops.map(o=>{
+    if (o.type==="eq") return htmlEscape(o.text);
+    if (o.type==="del") return `<span class="del">${htmlEscape(o.text)}</span>`;
+    return ""; // insertions not shown on left
+  }).join("");
+  // After: show eq + ins
+  const right = ops.map(o=>{
+    if (o.type==="eq") return htmlEscape(o.text);
+    if (o.type==="ins") return `<span class="ins">${htmlEscape(o.text)}</span>`;
+    return ""; // deletions not shown on right
+  }).join("");
+
+  return `
+  <div class="diff-pair">
+    <div class="diff-col">
+      <div class="diff-label">Before</div>
+      <div class="diff-box">${left}</div>
+    </div>
+    <div class="diff-col">
+      <div class="diff-label">After</div>
+      <div class="diff-box">${right}</div>
+    </div>
+  </div>`;
+}
+
+function buildChangedSnippetsHtml(beforeText, afterText, maxPairs=5) {
+  const A = splitSentences(beforeText);
+  const B = splitSentences(afterText);
+  const pairs = [];
+  const len = Math.min(A.length, B.length);
+  for (let i=0; i<len; i++) {
+    if (A[i] && B[i] && A[i] !== B[i]) {
+      pairs.push(renderSideBySide(A[i], B[i]));
+      if (pairs.length >= maxPairs) break;
+    }
+  }
+  // If more changes exist but pairs < max, try trailing extras
+  const extra = Math.max(A.length, B.length) - len;
+  if (pairs.length < maxPairs && extra > 0) {
+    const extras = (A.length > B.length ? A.slice(len) : B.slice(len)).slice(0, maxPairs - pairs.length);
+    for (const s of extras) {
+      if (A.length > B.length) {
+        pairs.push(renderSideBySide(s, ""));
+      } else {
+        pairs.push(renderSideBySide("", s));
+      }
+    }
+  }
+  if (!pairs.length) return `<div class="muted">No visible sentence-level changes detected.</div>`;
+  return pairs.join("\n");
+}
+
+function buildReportHtml({ mode, originalName, originalText, cleanedText, rephrasedText, stats, notes }) {
+  const style = `
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;padding:24px;line-height:1.6}
+    h1{font-size:20px;margin:0 0 12px}
+    h2{font-size:16px;margin:24px 0 8px}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+    .card{border:1px solid #eee;border-radius:12px;padding:16px}
+    .kv{display:grid;grid-template-columns:160px 1fr;gap:8px;margin:6px 0}
+    .muted{color:#666}
+    .badge{display:inline-block;background:#f5f5f5;border-radius:10px;padding:2px 8px;font-size:12px;margin-left:8px}
+    .diff-pair{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:12px 0}
+    .diff-col{}
+    .diff-label{font-size:12px;color:#666;margin-bottom:6px}
+    .diff-box{border:1px solid #eee;border-radius:10px;padding:12px;white-space:pre-wrap}
+    .ins{background:#e6ffed}
+    .del{background:#ffeef0;text-decoration:line-through}
+    ul.compact{margin:0;padding-left:18px}
+  </style>`;
+
+  const dup = stats.duplicatePunct;
+  const dupList = Object.entries(dup)
+    .filter(([,v])=>v>0)
+    .map(([k,v])=>`<li>${k} repeated: <strong>${v}</strong></li>`)
+    .join("");
+
+  const cleanedSection = `
+    <h2>Cleaned changes (Original → Cleaned)</h2>
+    <div class="card">
+      ${buildChangedSnippetsHtml(originalText, cleanedText, 5)}
+    </div>`;
+
+  const rephraseSection = rephrasedText ? `
+    <h2>Rephrase changes (Cleaned → Rephrased)</h2>
+    <div class="card">
+      ${buildChangedSnippetsHtml(cleanedText, rephrasedText, 5)}
+    </div>` : "";
+
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"/>
+    <title>DocSafe — Report</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    ${style}
+  </head><body>
+    <h1>DocSafe Report
+      <span class="badge">${mode === "V2" ? "V2 · Clean + Rephrase" : "V1 · Clean"}</span>
+    </h1>
+
+    <div class="grid">
+      <div class="card">
+        <div class="kv"><div><strong>File</strong></div><div>${originalName || "(untitled)"}</div></div>
+        <div class="kv"><div><strong>Chars (before)</strong></div><div>${stats.lengthBefore}</div></div>
+        <div class="kv"><div><strong>Chars (after)</strong></div><div>${stats.lengthAfter}</div></div>
+        <div class="kv"><div><strong>Delta</strong></div><div>${stats.lengthAfter - stats.lengthBefore}</div></div>
+        <div class="kv"><div><strong>Strict PDF</strong></div><div>${notes?.strictPdf ? "on" : "off"}</div></div>
+      </div>
+
+      <div class="card">
+        <div><strong>What changed</strong></div>
+        <ul class="compact">
+          <li>Zero-width characters removed: <strong>${stats.zeroWidthRemoved}</strong></li>
+          <li>Multi-space runs collapsed: <strong>${stats.doubleSpaceRuns}</strong></li>
+          <li>Spaces before punctuation fixed: <strong>${stats.spacesBeforePunct}</strong></li>
+          <li>Missing space after punctuation fixed: <strong>${stats.missingSpaceAfterPunct}</strong></li>
+          <li>Blank lines collapsed: <strong>${stats.collapsedBlankLines}</strong></li>
+          <li>Sentence starts capitalized (heuristic): <strong>${stats.sentenceCapitalized}</strong></li>
+          ${dupList ? `<li>Duplicate punctuation normalized:<ul class="compact">${dupList}</ul></li>` : ""}
+        </ul>
+      </div>
+    </div>
+
+    ${cleanedSection}
+    ${rephraseSection}
+
+    <p class="muted">Note: counts are heuristic; actual applied changes may vary slightly depending on document structure.</p>
+  </body></html>`;
+}
+
+/* ------------------------------- Routes ------------------------------- */
+
+app.get("/health", (_req,res)=> res.json({ ok:true, message:"Backend is running ✅" }));
+app.get("/_env_ok", (_req,res)=> res.json({ ok:true, NODE_ENV: process.env.NODE_ENV || "development" }));
+app.get("/_ai_echo", (req,res)=> res.json({ ok:true, echo: aiSpellGrammarPass(String(req.query.q||"Hello from AI")) }));
+app.get("/_ai_rephrase_echo", (req,res)=> res.json({ ok:true, rephrased: aiRephrase(String(req.query.q||"Hello from AI")) }));
+
+/* V1: Clean → ZIP = cleaned.docx + report.html */
+app.post("/clean", upload.any(), async (req,res)=>{
+  try {
+    if (!req.files?.length) return res.status(400).json({ ok:false, error:"No file uploaded" });
+    const strictPdf = String(req.body.strictPdf || "false") === "true";
+    const f = req.files[0];
+    const originalName = f.originalname || "input";
+    const originalText = await extractTextFromFile(f.buffer, originalName, strictPdf);
+    const lengthBefore = originalText.length;
+
+    const corrected = aiSpellGrammarPass(originalText);
+    const cleanedText = normalizeText(corrected);
+    const lengthAfter = cleanedText.length;
+
+    const cleanedPath = tmpPath("cleaned.docx");
+    await createDocxFromText(cleanedText, cleanedPath);
+
+    const stats = computeCleanStats(originalText, cleanedText, lengthBefore, lengthAfter);
+    const reportHtml = buildReportHtml({
+      mode: "V1",
+      originalName,
+      originalText,
+      cleanedText,
+      rephrasedText: null,
+      stats,
+      notes: { strictPdf }
+    });
+    const reportPath = tmpPath("report.html");
+    fs.writeFileSync(reportPath, reportHtml, "utf8");
+
+    const zipBuf = await zipFiles([
+      { path: cleanedPath, name: "cleaned.docx" },
+      { path: reportPath, name: "report.html" },
+    ]);
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", 'attachment; filename="docsafe_v1_result.zip"');
+    res.end(zipBuf);
+  } catch (e) {
+    console.error("CLEAN ERROR", e);
+    res.status(500).json({ ok:false, error:"CLEAN_ERROR", message:String(e) });
+  }
+});
+
+/* V2: Clean + Rephrase → ZIP = rephrased.docx + report.html */
+app.post("/clean-v2", upload.any(), async (req,res)=>{
+  try {
+    if (!reqfiles?.length && !req.files) throw new Error(); // safeguard old node? (will be ignored)
+  } catch {} // noop
+  try {
+    if (!req.files?.length) return res.status(400).json({ ok:false, error:"No file uploaded" });
+    const strictPdf = String(req.body.strictPdf || "false") === "true";
+    const f = req.files[0];
+    const originalName = f.originalname || "input";
+    const originalText = await extractTextFromFile(f.buffer, originalName, strictPdf);
+    const lengthBefore = originalText.length;
+
+    const corrected = aiSpellGrammarPass(originalText);
+    const cleanedText = normalizeText(corrected);
+    const rephrasedText = normalizeText(aiRephrase(cleanedText));
+    const lengthAfter = rephrasedText.length; // pour delta global affiché
+
+    const rephrasedPath = tmpPath("rephrased.docx");
+    await createDocxFromText(rephrasedText, rephrasedPath);
+
+    const stats = computeCleanStats(originalText, cleanedText, lengthBefore, cleanedText.length);
+    const reportHtml = buildReportHtml({
+      mode: "V2",
+      originalName,
+      originalText,
+      cleanedText,
+      rephrasedText,
+      stats,
+      notes: { strictPdf }
+    });
+    const reportPath = tmpPath("report.html");
+    fs.writeFileSync(reportPath, reportHtml, "utf8");
+
+    const zipBuf = await zipFiles([
+      { path: rephrasedPath, name: "rephrased.docx" },
+      { path: reportPath, name: "report.html" },
+    ]);
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", 'attachment; filename="docsafe_v2_result.zip"');
+    res.end(zipBuf);
+  } catch (e) {
+    console.error("CLEAN V2 ERROR", e);
+    res.status(500).json({ ok:false, error:"CLEAN_V2_ERROR", message:String(e) });
+  }
+});
+
+/* Helpers */
+function tmpPath(name){ return path.join(os.tmpdir(), `${Date.now()}_${name}`); }
+async function zipFiles(files){
+  return new Promise((resolve, reject)=>{
     const chunks = [];
-    const archive = archiver("zip", { zlib: { level: 9 } });
-    archive.on("warning", (e) => console.warn("zip warning:", e));
-    archive.on("error", (e) => reject(e));
-    archive.on("data", (d) => chunks.push(d));
-    archive.on("end", () => resolve(Buffer.concat(chunks)));
+    const archive = archiver("zip", { zlib: { level: 9 }});
+    archive.on("warning", (e)=>console.warn("zip warn:", e));
+    archive.on("error", (e)=>reject(e));
+    archive.on("data", (d)=>chunks.push(d));
+    archive.on("end", ()=>resolve(Buffer.concat(chunks)));
     archive.append("", { name: ".keep" });
     for (const f of files) archive.file(f.path, { name: f.name });
     archive.finalize();
   });
 }
 
-/* ----------- Health/Echo ----------- */
-app.get("/health", (_req, res) => res.json({ ok: true, message: "Backend is running ✅" }));
-app.get("/_env_ok", (_req, res) => res.json({ ok: true, NODE_ENV: process.env.NODE_ENV || "development" }));
-app.get("/_ai_echo", (req, res) => res.json({ ok: true, echo: aiSpellGrammarPass(String(req.query.q || "Hello from AI")) }));
-app.get("/_ai_rephrase_echo", (req, res) => res.json({ ok: true, rephrased: aiRephrase(String(req.query.q || "Hello from AI")) }));
-
-/* ----------- V1: cleaned + report ----------- */
-app.post("/clean", upload.any(), async (req, res) => {
-  try {
-    if (!req.files?.length) return res.status(400).json({ ok: false, error: "No file uploaded" });
-    const strictPdf = String(req.body.strictPdf || "false") === "true";
-    const f = req.files[0];
-    const originalName = f.originalname || "input";
-    const rawText = await extractTextFromFile(f.buffer, originalName, strictPdf);
-    const lengthBefore = rawText.length;
-
-    const corrected = aiSpellGrammarPass(rawText);
-    const normalized = normalizeText(corrected);
-    const lengthAfter = normalized.length;
-
-    const cleanedPath = tmpPath("cleaned.docx");
-    await createDocxFromText(normalized, cleanedPath);
-
-    const reportPath = tmpPath("report.html");
-    fs.writeFileSync(
-      reportPath,
-      buildReportHtml({ originalName, lengthBefore, lengthAfter, notes: { strictPdf } }),
-      "utf8"
-    );
-
-    const zipBuf = await zipFiles([
-      { path: cleanedPath, name: "cleaned.docx" },
-      { path: reportPath, name: "report.html" },
-    ]);
-
-    res.setHeader("Content-Type", "application/zip");
-    res.setHeader("Content-Disposition", 'attachment; filename="docsafe_v1_result.zip"');
-    res.end(zipBuf);
-  } catch (error) {
-    console.error("CLEAN ERROR", error);
-    res.status(500).json({ ok: false, error: "CLEAN_ERROR", message: String(error) });
-  }
-});
-
-/* ----------- V2: rephrased + report (UNIQUEMENT) ----------- */
-app.post("/clean-v2", upload.any(), async (req, res) => {
-  try {
-    if (!req.files?.length) return res.status(400).json({ ok: false, error: "No file uploaded" });
-    const strictPdf = String(req.body.strictPdf || "false") === "true";
-    const f = req.files[0];
-    const originalName = f.originalname || "input";
-    const rawText = await extractTextFromFile(f.buffer, originalName, strictPdf);
-    const lengthBefore = rawText.length;
-
-    // pipeline V1 (mais on ne garde PAS le fichier cleaned)
-    const corrected = aiSpellGrammarPass(rawText);
-    const normalized = normalizeText(corrected);
-    const lengthAfter = normalized.length;
-
-    // rephrase puis docx
-    const rephrased = normalizeText(aiRephrase(normalized));
-    const rephrasedPath = tmpPath("rephrased.docx");
-    await createDocxFromText(rephrased, rephrasedPath);
-
-    // report
-    const reportPath = tmpPath("report.html");
-    fs.writeFileSync(
-      reportPath,
-      buildReportHtml({ originalName, lengthBefore, lengthAfter, notes: { strictPdf } }),
-      "utf8"
-    );
-
-    // ZIP: uniquement rephrased + report
-    const zipBuf = await zipFiles([
-      { path: rephrasedPath, name: "rephrased.docx" },
-      { path: reportPath, name: "report.html" },
-    ]);
-
-    res.setHeader("Content-Type", "application/zip");
-    res.setHeader("Content-Disposition", 'attachment; filename="docsafe_v2_result.zip"');
-    res.end(zipBuf);
-  } catch (error) {
-    console.error("CLEAN V2 ERROR", error);
-    res.status(500).json({ ok: false, error: "CLEAN_V2_ERROR", message: String(error) });
-  }
-});
-
+/* Render binding */
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`DocSafe backend listening on ${PORT}`));
+app.listen(PORT, ()=> console.log(`DocSafe backend listening on ${PORT}`));
 
