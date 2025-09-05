@@ -24,21 +24,26 @@ const app = express();
 app.use(compression());
 app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
 
-// ===== LOGGING & DIAG =====
+// ---- Logs de base
 app.use((req, _res, next) => { console.log(`[REQ] ${req.method} ${req.url}`); next(); });
-process.on('unhandledRejection', (e) => console.error('UNHANDLED REJECTION', e));
-process.on('uncaughtException', (e) => console.error('UNCAUGHT EXCEPTION', e));
+process.on('unhandledRejection', e => console.error('UNHANDLED REJECTION', e));
+process.on('uncaughtException', e => console.error('UNCAUGHT EXCEPTION', e));
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-// Health & ENV
+// ---- Health & ENV
 app.get('/health', (_req, res) => res.json({ ok: true, message: 'Backend is running ✅' }));
 app.get('/_env_ok', (_req, res) => {
   const hasKey = typeof process.env.OPENAI_API_KEY === 'string' && process.env.OPENAI_API_KEY.length > 10;
-  res.json({ ok: true, AI_PROVIDER: process.env.AI_PROVIDER || null, AI_MODEL: process.env.AI_MODEL || null, OPENAI_API_KEY_present: hasKey });
+  res.json({
+    ok: true,
+    AI_PROVIDER: process.env.AI_PROVIDER || null,
+    AI_MODEL: process.env.AI_MODEL || null,
+    OPENAI_API_KEY_present: hasKey
+  });
 });
 
-// === DIAG (tolérant) ===
+// ---- DIAG (tolérants)
 app.get('/_ai_echo', async (_req, res) => {
   try {
     const sample = 'soc ial enablin g commu nication, dis   connection.';
@@ -63,17 +68,14 @@ app.get('/_ai_rephrase_echo', async (_req, res) => {
   }
 });
 
-/** Pipelines
- * V1: nettoyage + IA-correction -> cleaned.docx (toujours) + binaire nettoyé + report
- * V2: V1 + IA-reformulation -> rephrased.docx (toujours)
- */
+// ---- Pipeline principal
 async function processFile({ buffer, filename, strictPdf = false, mode = 'v1' }) {
   if (!buffer || !filename) throw new Error('No file uploaded');
 
   const mime = await detectMime(buffer, filename);
   const ext = inferExt(filename, mime);
 
-  // 1) Nettoyage binaire (métadonnées, normalisation basique XML/texte)
+  // 1) Nettoyage binaire (PDF / DOCX / PPTX)
   let cleanedBuffer = buffer;
   if (ext === '.pdf') {
     const { outBuffer } = await cleanPDF(buffer, { strict: strictPdf });
@@ -94,16 +96,16 @@ async function processFile({ buffer, filename, strictPdf = false, mode = 'v1' })
   if (ext === '.docx') rawText = await extractFromDocx(cleanedBuffer);
   if (ext === '.pptx') rawText = await extractFromPptx(cleanedBuffer);
 
-  // 3) Normalisation mécanique (toujours au moins ça)
+  // 3) Normalisation mécanique (toujours)
   const normalized = normalizeText(rawText || '');
 
-  // 4) LanguageTool (optionnel, juste pour report)
+  // 4) LanguageTool (facultatif pour rapport)
   let ltResult = null;
   if (process.env.LT_ENDPOINT && normalized) {
     try { ltResult = await ltCheck(normalized); } catch { ltResult = null; }
   }
 
-  // 5) IA
+  // 5) IA (avec fallbacks)
   let proofText = null;
   let rephraseText = null;
 
@@ -118,15 +120,15 @@ async function processFile({ buffer, filename, strictPdf = false, mode = 'v1' })
   // 6) Sorties
   const files = [];
 
-  // (a) Binaire nettoyé d’origine (pour archivage/trace)
+  // (a) Binaire nettoyé
   files.push({ name: `cleaned-binary${ext}`, data: cleanedBuffer });
 
-  // (b) V1: cleaned.docx — TOUJOURS (au pire: texte normalisé)
+  // (b) V1: cleaned.docx — toujours
   const v1Text = proofText || normalized;
   const v1Docx = await createDocxFromText(v1Text, { title: 'DocSafe Cleaned (V1)' });
   files.push({ name: 'cleaned.docx', data: v1Docx });
 
-  // (c) V2: rephrased.docx — TOUJOURS si mode v2 (au pire: texte corrigé/normalisé)
+  // (c) V2: rephrased.docx — toujours si mode v2
   if (mode === 'v2') {
     const v2Text = rephraseText || proofText || normalized;
     const v2Docx = await createDocxFromText(v2Text, { title: 'DocSafe Rephrased (V2)' });
@@ -151,36 +153,48 @@ async function processFile({ buffer, filename, strictPdf = false, mode = 'v1' })
   return await zipOutput(files);
 }
 
-// Routes
-app.post('/clean', upload.single('file'), async (req, res) => {
+// ---- Routes upload (tolérantes): on accepte n'importe quel nom de champ
+app.post('/clean', upload.any(), async (req, res) => {
   try {
     const strictPdf = req.body?.strictPdf === 'true';
-    const zip = await processFile({
-      buffer: req.file?.buffer, filename: req.file?.originalname, strictPdf, mode: 'v1'
+    const first = (req.files || [])[0];
+    if (!first?.buffer) throw new Error('No file uploaded (backend did not receive a file field)');
+    const zipBuffer = await processFile({
+      buffer: first.buffer,
+      filename: first.originalname,
+      strictPdf,
+      mode: 'v1'
     });
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader('Content-Disposition', 'attachment; filename="docsafe-v1.zip"');
-    res.send(zip);
+    res.send(zipBuffer);
   } catch (e) {
-    console.error('CLEAN ERROR', e);
+    console.error('CLEAN ERROR', e, 'headers:', req.headers['content-type']);
     res.status(500).json({ ok: false, route: '/clean', error: e?.message || String(e) });
   }
 });
 
-app.post('/clean-v2', upload.single('file'), async (req, res) => {
+app.post('/clean-v2', upload.any(), async (req, res) => {
   try {
     const strictPdf = req.body?.strictPdf === 'true';
-    const zip = await processFile({
-      buffer: req.file?.buffer, filename: req.file?.originalname, strictPdf, mode: 'v2'
+    const first = (req.files || [])[0];
+    if (!first?.buffer) throw new Error('No file uploaded (backend did not receive a file field)');
+    const zipBuffer = await processFile({
+      buffer: first.buffer,
+      filename: first.originalname,
+      strictPdf,
+      mode: 'v2'
     });
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader('Content-Disposition', 'attachment; filename="docsafe-v2.zip"');
-    res.send(zip);
+    res.send(zipBuffer);
   } catch (e) {
-    console.error('CLEAN-V2 ERROR', e);
+    console.error('CLEAN-V2 ERROR', e, 'headers:', req.headers['content-type']);
     res.status(500).json({ ok: false, route: '/clean-v2', error: e?.message || String(e) });
   }
 });
 
+// ---- Listen
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`DocSafe backend running on :${PORT}`));
+
