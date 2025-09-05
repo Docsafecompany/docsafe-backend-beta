@@ -21,17 +21,31 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-app.use(compression());
-app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
 
-// ---- Logs
+// CORS permissif (front Vercel → backend Render)
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*'); // si tu veux restreindre → mets l’URL Vercel
+  res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+  next();
+});
+app.options('*', (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+  return res.sendStatus(204);
+});
+
+app.use(compression());
+app.use(express.json({ limit: '20mb' }));
+app.use(express.urlencoded({ extended: true, limit: '20mb' }));
+
+// Logs simples
 app.use((req, _res, next) => { console.log(`[REQ] ${req.method} ${req.url}`); next(); });
-process.on('unhandledRejection', e => console.error('UNHANDLED REJECTION', e));
-process.on('uncaughtException', e => console.error('UNCAUGHT EXCEPTION', e));
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-// ---- Health & ENV
+// Health
 app.get('/health', (_req, res) => res.json({ ok: true, message: 'Backend is running ✅' }));
 app.get('/_env_ok', (_req, res) => {
   const hasKey = typeof process.env.OPENAI_API_KEY === 'string' && process.env.OPENAI_API_KEY.length > 10;
@@ -43,12 +57,11 @@ app.get('/_env_ok', (_req, res) => {
   });
 });
 
-// ---- DIAG IA
+// Diag IA
 app.get('/_ai_echo', async (_req, res) => {
   try {
     const sample = 'soc ial enablin g commu nication, dis   connection.';
     const proof = await aiProofread(sample);
-    if (!proof) return res.json({ ok: false, where: '_ai_echo', notice: 'AI unavailable (rate-limited or error)', proof: null });
     res.json({ ok: true, in: sample, proof });
   } catch (e) {
     res.json({ ok: false, where: '_ai_echo', error: e?.message || String(e) });
@@ -57,115 +70,66 @@ app.get('/_ai_echo', async (_req, res) => {
 
 app.get('/_ai_rephrase_echo', async (_req, res) => {
   try {
-    const sample = 'Notre solution réduit fortement les erreurs et améliore la qualité des documents. Elle s’intègre facilement aux outils existants.';
+    const sample = 'Notre solution réduit fortement les erreurs et améliore la qualité des documents.';
     const proof = await aiProofread(sample);
-    const base = proof || sample;
-    const reph = await aiRephrase(base);
-    if (!reph) return res.json({ ok: false, where: '_ai_rephrase_echo', notice: 'AI unavailable (rate-limited or error)', proof, rephrase: null });
+    const reph = await aiRephrase(proof || sample);
     res.json({ ok: true, in: sample, proof, rephrase: reph });
   } catch (e) {
     res.json({ ok: false, where: '_ai_rephrase_echo', error: e?.message || String(e) });
   }
 });
 
-// ---- Pipeline principal
+// Fonction principale
 async function processFile({ buffer, filename, strictPdf = false, mode = 'v1' }) {
-  if (!buffer || !filename) throw new Error('No file uploaded');
+  if (!buffer) throw new Error('No file uploaded');
 
   const mime = await detectMime(buffer, filename);
   const ext = inferExt(filename, mime);
 
-  // 1) Nettoyage binaire (passe toujours { sections: [] } pour les libs qui le requièrent)
   let cleanedBuffer = buffer;
-  try {
-    if (ext === '.pdf') {
-      const { outBuffer } = await cleanPDF(buffer, { strict: strictPdf, sections: [] });
-      cleanedBuffer = outBuffer;
-    } else if (ext === '.docx') {
-      const { outBuffer } = await cleanDOCX(buffer, { sections: [] });
-      cleanedBuffer = outBuffer;
-    } else if (ext === '.pptx') {
-      const { outBuffer } = await cleanPPTX(buffer, { sections: [] });
-      cleanedBuffer = outBuffer;
-    } else {
-      throw new Error('Format non supporté. Utilisez PDF/DOCX/PPTX.');
-    }
-  } catch (e) {
-    console.error('BINARY CLEAN ERROR', e);
-    throw e;
+  if (ext === '.pdf') {
+    const { outBuffer } = await cleanPDF(buffer, { strict: strictPdf, sections: [] });
+    cleanedBuffer = outBuffer;
+  } else if (ext === '.docx') {
+    const { outBuffer } = await cleanDOCX(buffer, { sections: [] });
+    cleanedBuffer = outBuffer;
+  } else if (ext === '.pptx') {
+    const { outBuffer } = await cleanPPTX(buffer, { sections: [] });
+    cleanedBuffer = outBuffer;
   }
 
-  // 2) Extraction robuste
   let rawText = '';
-  try {
-    if (ext === '.pdf') rawText = await extractFromPdf(cleanedBuffer);
-    if (ext === '.docx') rawText = await extractFromDocx(cleanedBuffer);
-    if (ext === '.pptx') rawText = await extractFromPptx(cleanedBuffer);
-  } catch (e) {
-    console.error('EXTRACT ERROR', e);
-  }
+  if (ext === '.pdf') rawText = await extractFromPdf(cleanedBuffer);
+  if (ext === '.docx') rawText = await extractFromDocx(cleanedBuffer);
+  if (ext === '.pptx') rawText = await extractFromPptx(cleanedBuffer);
 
-  // 3) Normalisation mécanique (toujours)
   const normalized = normalizeText(rawText || '');
 
-  // 4) LanguageTool (tolérant : essaie plusieurs signatures)
-  let ltResult = null;
-  if (process.env.LT_ENDPOINT && normalized) {
-    try {
-      // cas 1: ltCheck(text, { sections: [] })
-      try {
-        ltResult = await ltCheck(normalized, { sections: [] });
-      } catch (e1) {
-        // cas 2: ltCheck({ text, sections: [] })
-        try {
-          ltResult = await ltCheck({ text: normalized, sections: [] });
-        } catch (e2) {
-          // cas 3: ltCheck(text)
-          ltResult = await ltCheck(normalized);
-        }
-      }
-    } catch (e) {
-      console.warn('LanguageTool disabled (fallback):', e?.message || String(e));
-      ltResult = null;
-    }
-  }
-
-  // 5) IA (avec fallbacks)
   let proofText = null;
   let rephraseText = null;
 
   if (normalized) {
-    try { proofText = await aiProofread(normalized); } catch (e) { console.error('aiProofread error', e); }
+    try { proofText = await aiProofread(normalized); } catch {}
     if (mode === 'v2') {
-      const base = proofText || normalized;
-      try { rephraseText = await aiRephrase(base); } catch (e) { console.error('aiRephrase error', e); }
+      try { rephraseText = await aiRephrase(proofText || normalized); } catch {}
     }
   }
 
-  // 6) Sorties
   const files = [];
-
-  // (a) Binaire nettoyé
   files.push({ name: `cleaned-binary${ext}`, data: cleanedBuffer });
 
-  // (b) V1: cleaned.docx — toujours
-  const v1Text = proofText || normalized;
-  const v1Docx = await createDocxFromText(v1Text, { title: 'DocSafe Cleaned (V1)' });
+  const v1Docx = await createDocxFromText(proofText || normalized, { title: 'DocSafe Cleaned (V1)' });
   files.push({ name: 'cleaned.docx', data: v1Docx });
 
-  // (c) V2: rephrased.docx — toujours si mode v2
   if (mode === 'v2') {
-    const v2Text = rephraseText || proofText || normalized;
-    const v2Docx = await createDocxFromText(v2Text, { title: 'DocSafe Rephrased (V2)' });
+    const v2Docx = await createDocxFromText(rephraseText || proofText || normalized, { title: 'DocSafe Rephrased (V2)' });
     files.push({ name: 'rephrased.docx', data: v2Docx });
   }
 
-  // (d) Report
   const reportHtml = generateReportHTML({
     filename,
     mime,
     baseStats: { length: (normalized || '').length },
-    lt: ltResult,
     ai: { applied: true, mode, proofed: !!proofText, rephrased: !!rephraseText }
   });
   files.push({ name: 'report.html', data: Buffer.from(reportHtml, 'utf-8') });
@@ -173,48 +137,34 @@ async function processFile({ buffer, filename, strictPdf = false, mode = 'v1' })
   return await zipOutput(files);
 }
 
-// ---- Routes upload (tolérantes): on accepte n'importe quel nom de champ
+// Routes
 app.post('/clean', upload.any(), async (req, res) => {
   try {
-    const strictPdf = req.body?.strictPdf === 'true';
-    const first = (req.files || [])[0];
-    if (!first?.buffer) throw new Error('No file uploaded (backend did not receive a file field)');
-    const zipBuffer = await processFile({
-      buffer: first.buffer,
-      filename: first.originalname,
-      strictPdf,
-      mode: 'v1'
-    });
+    const file = (req.files || [])[0];
+    if (!file?.buffer) throw new Error('No file uploaded');
+    const zipBuffer = await processFile({ buffer: file.buffer, filename: file.originalname, strictPdf: req.body?.strictPdf === 'true', mode: 'v1' });
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader('Content-Disposition', 'attachment; filename="docsafe-v1.zip"');
     res.send(zipBuffer);
   } catch (e) {
-    console.error('CLEAN ERROR', e, 'headers:', req.headers['content-type']);
+    console.error('CLEAN ERROR', e);
     res.status(500).json({ ok: false, route: '/clean', error: e?.message || String(e) });
   }
 });
 
 app.post('/clean-v2', upload.any(), async (req, res) => {
   try {
-    const strictPdf = req.body?.strictPdf === 'true';
-    const first = (req.files || [])[0];
-    if (!first?.buffer) throw new Error('No file uploaded (backend did not receive a file field)');
-    const zipBuffer = await processFile({
-      buffer: first.buffer,
-      filename: first.originalname,
-      strictPdf,
-      mode: 'v2'
-    });
+    const file = (req.files || [])[0];
+    if (!file?.buffer) throw new Error('No file uploaded');
+    const zipBuffer = await processFile({ buffer: file.buffer, filename: file.originalname, strictPdf: req.body?.strictPdf === 'true', mode: 'v2' });
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader('Content-Disposition', 'attachment; filename="docsafe-v2.zip"');
     res.send(zipBuffer);
   } catch (e) {
-    console.error('CLEAN-V2 ERROR', e, 'headers:', req.headers['content-type']);
+    console.error('CLEAN-V2 ERROR', e);
     res.status(500).json({ ok: false, route: '/clean-v2', error: e?.message || String(e) });
   }
 });
 
-// ---- Listen
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`DocSafe backend running on :${PORT}`));
-
