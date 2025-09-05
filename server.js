@@ -44,16 +44,10 @@ async function processFile({ buffer, filename, strictPdf = false, mode = 'v1' })
   if (mime === 'application/pdf' || ext === '.pdf') {
     const { outBuffer, text } = await cleanPDF(buffer, { strict: strictPdf });
     cleanedBuffer = outBuffer; extractedText = text || '';
-  } else if (
-    mime === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' ||
-    ext === '.docx'
-  ) {
+  } else if (mime === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || ext === '.docx') {
     const { outBuffer, text } = await cleanDOCX(buffer);
     cleanedBuffer = outBuffer; extractedText = text || '';
-  } else if (
-    mime === 'application/vnd.openxmlformats-officedocument.presentationml.presentation' ||
-    ext === '.pptx'
-  ) {
+  } else if (mime === 'application/vnd.openxmlformats-officedocument.presentationml.presentation' || ext === '.pptx') {
     const { outBuffer, text } = await cleanPPTX(buffer);
     cleanedBuffer = outBuffer; extractedText = text || '';
   } else {
@@ -75,7 +69,7 @@ async function processFile({ buffer, filename, strictPdf = false, mode = 'v1' })
   // V1: correction IA (= orthographe/espaces sans reformulation)
   try { proofText = await aiProofread(normalized); } catch { proofText = null; }
 
-  // V2: reformulation en plus
+  // V2: reformulation en plus (sur le texte corrigé si dispo)
   if (mode === 'v2') {
     const baseForRephrase = proofText || normalized;
     try { rephraseText = await aiRephrase(baseForRephrase); } catch { rephraseText = null; }
@@ -93,9 +87,10 @@ async function processFile({ buffer, filename, strictPdf = false, mode = 'v1' })
     files.push({ name: `cleaned${ext}`, data: cleanedBuffer });
   }
 
-  // 2) V2: rephrased.docx
-  if (mode === 'v2' && rephraseText) {
-    const reDocx = await createDocxFromText(rephraseText, { title: 'DocSafe Rephrased (V2)' });
+  // 2) V2: rephrased.docx (toujours généré en mode v2)
+  if (mode === 'v2') {
+    const base = rephraseText || proofText || normalized || '';
+    const reDocx = await createDocxFromText(base, { title: 'DocSafe Rephrased (V2)' });
     files.push({ name: 'rephrased.docx', data: reDocx });
   }
 
@@ -150,7 +145,7 @@ app.post('/clean-v2', upload.single('file'), async (req, res) => {
   }
 });
 
-// --- Routes DIAG (retire-les quand OK) ---
+// --- Routes DIAG ---
 app.get('/_ai_echo', async (_req, res) => {
   try {
     const sample = 'soc ial enablin g commu nication, dis   connection.';
@@ -161,16 +156,16 @@ app.get('/_ai_echo', async (_req, res) => {
   }
 });
 
-app.post('/_diag_docx', upload.single('file'), async (req, res) => {
+app.get('/_ai_rephrase_echo', async (_req, res) => {
   try {
-    const { outBuffer, text } = await cleanDOCX(req.file.buffer);
-    res.json({ ok: true, extractedLen: (text||'').length, head: (text||'').slice(0,120) });
+    const sample = 'Notre solution réduit fortement les erreurs et améliore la qualité des documents. Elle s’intègre facilement aux outils existants.';
+    const proof = await aiProofread(sample);
+    const reph = await aiRephrase(proof || sample);
+    res.json({ ok: true, in: sample, proof, rephrase: reph });
   } catch (e) {
-    res.status(500).json({ ok: false, where: '_diag_docx', error: String(e.message || e) });
+    res.status(500).json({ ok: false, where: '_ai_rephrase_echo', error: String(e.message || e) });
   }
 });
 
-// Single listen
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`DocSafe backend running on :${PORT}`));
-
