@@ -24,7 +24,7 @@ const app = express();
 app.use(compression());
 app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
 
-// ---- Logs de base
+// ---- Logs
 app.use((req, _res, next) => { console.log(`[REQ] ${req.method} ${req.url}`); next(); });
 process.on('unhandledRejection', e => console.error('UNHANDLED REJECTION', e));
 process.on('uncaughtException', e => console.error('UNCAUGHT EXCEPTION', e));
@@ -43,7 +43,7 @@ app.get('/_env_ok', (_req, res) => {
   });
 });
 
-// ---- DIAG (tolérants)
+// ---- DIAG IA
 app.get('/_ai_echo', async (_req, res) => {
   try {
     const sample = 'soc ial enablin g commu nication, dis   connection.';
@@ -75,34 +75,59 @@ async function processFile({ buffer, filename, strictPdf = false, mode = 'v1' })
   const mime = await detectMime(buffer, filename);
   const ext = inferExt(filename, mime);
 
-  // 1) Nettoyage binaire (PDF / DOCX / PPTX)
+  // 1) Nettoyage binaire (passe toujours { sections: [] } pour les libs qui le requièrent)
   let cleanedBuffer = buffer;
-  if (ext === '.pdf') {
-    const { outBuffer } = await cleanPDF(buffer, { strict: strictPdf });
-    cleanedBuffer = outBuffer;
-  } else if (ext === '.docx') {
-    const { outBuffer } = await cleanDOCX(buffer);
-    cleanedBuffer = outBuffer;
-  } else if (ext === '.pptx') {
-    const { outBuffer } = await cleanPPTX(buffer);
-    cleanedBuffer = outBuffer;
-  } else {
-    throw new Error('Format non supporté. Utilisez PDF/DOCX/PPTX.');
+  try {
+    if (ext === '.pdf') {
+      const { outBuffer } = await cleanPDF(buffer, { strict: strictPdf, sections: [] });
+      cleanedBuffer = outBuffer;
+    } else if (ext === '.docx') {
+      const { outBuffer } = await cleanDOCX(buffer, { sections: [] });
+      cleanedBuffer = outBuffer;
+    } else if (ext === '.pptx') {
+      const { outBuffer } = await cleanPPTX(buffer, { sections: [] });
+      cleanedBuffer = outBuffer;
+    } else {
+      throw new Error('Format non supporté. Utilisez PDF/DOCX/PPTX.');
+    }
+  } catch (e) {
+    console.error('BINARY CLEAN ERROR', e);
+    throw e;
   }
 
   // 2) Extraction robuste
   let rawText = '';
-  if (ext === '.pdf') rawText = await extractFromPdf(cleanedBuffer);
-  if (ext === '.docx') rawText = await extractFromDocx(cleanedBuffer);
-  if (ext === '.pptx') rawText = await extractFromPptx(cleanedBuffer);
+  try {
+    if (ext === '.pdf') rawText = await extractFromPdf(cleanedBuffer);
+    if (ext === '.docx') rawText = await extractFromDocx(cleanedBuffer);
+    if (ext === '.pptx') rawText = await extractFromPptx(cleanedBuffer);
+  } catch (e) {
+    console.error('EXTRACT ERROR', e);
+  }
 
   // 3) Normalisation mécanique (toujours)
   const normalized = normalizeText(rawText || '');
 
-  // 4) LanguageTool (facultatif pour rapport)
+  // 4) LanguageTool (tolérant : essaie plusieurs signatures)
   let ltResult = null;
   if (process.env.LT_ENDPOINT && normalized) {
-    try { ltResult = await ltCheck(normalized); } catch { ltResult = null; }
+    try {
+      // cas 1: ltCheck(text, { sections: [] })
+      try {
+        ltResult = await ltCheck(normalized, { sections: [] });
+      } catch (e1) {
+        // cas 2: ltCheck({ text, sections: [] })
+        try {
+          ltResult = await ltCheck({ text: normalized, sections: [] });
+        } catch (e2) {
+          // cas 3: ltCheck(text)
+          ltResult = await ltCheck(normalized);
+        }
+      }
+    } catch (e) {
+      console.warn('LanguageTool disabled (fallback):', e?.message || String(e));
+      ltResult = null;
+    }
   }
 
   // 5) IA (avec fallbacks)
@@ -141,12 +166,7 @@ async function processFile({ buffer, filename, strictPdf = false, mode = 'v1' })
     mime,
     baseStats: { length: (normalized || '').length },
     lt: ltResult,
-    ai: {
-      applied: true,
-      mode,
-      proofed: !!proofText,
-      rephrased: !!rephraseText
-    }
+    ai: { applied: true, mode, proofed: !!proofText, rephrased: !!rephraseText }
   });
   files.push({ name: 'report.html', data: Buffer.from(reportHtml, 'utf-8') });
 
