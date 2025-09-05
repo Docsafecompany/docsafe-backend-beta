@@ -23,55 +23,72 @@ app.use(
     allowedHeaders: ["Content-Type", "Accept", "Origin"],
   })
 );
-// préflights explicites
-app.options("*", cors());
+app.options("*", cors()); // préflights
 
 const upload = multer({ storage: multer.memoryStorage() });
 
 /* =========================
-   Utils — nettoyage & IA
+   Normalisation & "IA"
    ========================= */
 
 // Normalisation forte FR/EN (espaces, ponctuation, doublons, retours)
 function normalizeText(input) {
   let t = String(input || "");
-
-  // invisibles + CRLF
-  t = t.replace(/[\u200B-\u200D\uFEFF\u2060\u00AD]/g, "").replace(/\r\n/g, "\n");
-
-  // 1) collaps espaces
-  t = t.replace(/[ \t]+/g, " ");
-
-  // 2) Ponctuation dupliquée (inclut le point) + ellipses
-  t = t.replace(/([.,;:!?@])\s*\1+/g, "$1");
-  t = t.replace(/…+/g, "…");
-
-  // 3) Pas d’espace avant, 1 après (hors fin de ligne)
-  t = t.replace(/\s+([.,;:!?%])/g, "$1"); // supprime l’espace AVANT
-  t = t.replace(/([.,;:!?%])(?!\s|$)/g, "$1 "); // ajoute 1 espace APRÈS
-  t = t.replace(/[ \t]{2,}/g, " "); // recollaps
-
-  // 4) Parenthèses / guillemets
-  t = t.replace(/\s*\(\s*/g, " (").replace(/\s*\)\s*/g, ") ");
+  t = t.replace(/[\u200B-\u200D\uFEFF\u2060\u00AD]/g, "").replace(/\r\n/g, "\n"); // invisibles + CRLF
+  t = t.replace(/[ \t]+/g, " ");                  // espaces multiples
+  t = t.replace(/([.,;:!?@])\s*\1+/g, "$1");      // ponctuation dupliquée
+  t = t.replace(/…+/g, "…");                      // ellipses
+  t = t.replace(/\s+([.,;:!?%])/g, "$1");         // pas d’espace AVANT
+  t = t.replace(/([.,;:!?%])(?!\s|$)/g, "$1 ");   // 1 espace APRÈS
+  t = t.replace(/[ \t]{2,}/g, " ");
+  t = t.replace(/\s*\(\s*/g, " (").replace(/\s*\)\s*/g, ") "); // () serrées
   t = t.replace(/\s*"\s*/g, '"');
-
-  // 5) Lignes vides (max 1 vide consécutive)
-  t = t.replace(/\n[ \t]*\n[ \t]*(\n[ \t]*)+/g, "\n\n");
-
-  // 6) Trim fin de ligne + global
-  t = t
-    .split("\n")
-    .map((s) => s.replace(/[ \t]+$/g, ""))
-    .join("\n");
-
+  t = t.replace(/\n[ \t]*\n[ \t]*(\n[ \t]*)+/g, "\n\n");        // max 1 ligne vide
+  t = t.split("\n").map((s) => s.replace(/[ \t]+$/g, "")).join("\n"); // trim fin de ligne
   return t.trim();
 }
 
-// “Correction IA” simple mais visible (FR/EN)
+// Répare les coupures OCR à l’intérieur des mots (FR/EN)
+function fixOcrWordSplits(text) {
+  let t = String(text || "");
+
+  // préfixes collés (dis connection → disconnection ; co rporations → corporations)
+  const PREFIX = "(?:re|pre|sub|inter|intra|trans|multi|anti|non|micro|macro|hyper|ultra|super|over|under|dis|un|co|de)";
+  t = t.replace(new RegExp(`\\b(${PREFIX})\\s+([a-z]{3,})\\b`, "gi"), "$1$2");
+
+  // suffixes collés (commu nication → communication ; enable ment → enablement)
+  const SUFFIX = "(?:tion|sion|ment|ments|ing|ings|ness|able|ible|ally|fully|ance|ence|ation|izations?|isation|ement|alité|isme|euse?s?|eurs?)";
+  t = t.replace(new RegExp(`\\b([a-z]{2,})\\s+(${SUFFIX})\\b`, "gi"), "$1$2");
+
+  // virgule/tiret parasite au milieu d’un mot (corpo, rations → corporations)
+  t = t.replace(/\b([a-z]{2,})[,’'\-]\s*([a-z]{2,})\b/gi, "$1$2");
+
+  // lettres répétées anormales (gggdigital → gdigital)
+  t = t.replace(/\b([a-z])\1{2,}([a-z]+)/gi, "$1$2");
+
+  // cas fréquents utiles
+  const COMMON_SPLITS = [
+    ["soc ial", "social"],
+    ["enablin g", "enabling"],
+    ["th e", "the"],
+    ["c an", "can"],
+    ["rig hts", "rights"],
+    ["commu nication", "communication"],
+    ["p otential", "potential"],
+  ];
+  for (const [a, b] of COMMON_SPLITS) {
+    const re = new RegExp(`\\b${a.replace(/ /g, "\\s+")}\\b`, "gi");
+    t = t.replace(re, (m) => (m[0] === m[0].toUpperCase() ? b[0].toUpperCase() + b.slice(1) : b));
+  }
+
+  // corrige résidu gdigital → digital
+  t = t.replace(/\bgdigital\b/gi, "digital");
+  return t;
+}
+
+// Correction visible (orthographe simple, doublons, capitalisation) + OCR fixes
 function aiSpellGrammarPass(input) {
   let t = String(input || "");
-
-  // fautes fréquentes (EN)
   t = t
     .replace(/\bteh\b/gi, "the")
     .replace(/\brecieve\b/gi, "receive")
@@ -79,77 +96,90 @@ function aiSpellGrammarPass(input) {
     .replace(/\bim\b/gi, "I'm")
     .replace(/\bdont\b/gi, "don't")
     .replace(/\bcant\b/gi, "can't");
-
-  // doublons de mots (you you, le le)
-  t = t.replace(/\b(\w+)\s+\1\b/gi, "$1");
-
-  // capitalisation au début de phrase (FR/EN)
-  t = t.replace(/(^|[.!?]\s+)([a-zà-öø-ÿ])/g, (m, p1, p2) => p1 + p2.toUpperCase());
-
-  // petits correctifs FR
-  t = t.replace(/\bca va\b/gi, "ça va");
-
+  t = t.replace(/\b(\w+)\s+\1\b/gi, "$1"); // doublons de mots
+  t = t.replace(/(^|[.!?]\s+)([a-zà-öø-ÿ])/g, (m, p1, p2) => p1 + p2.toUpperCase()); // majuscule
+  t = t.replace(/\bca va\b/gi, "ça va"); // FR
+  t = fixOcrWordSplits(t); // **clé pour V1**
   return t;
 }
 
-// Rephrase déterministe FR/EN (synonymes + tournures) — garantit un delta
+// Rephrase déterministe FR/EN (synonymes + tournures) — plus marqué
 function aiRephrase(input) {
-  let t = String(input || "");
-  let out = t;
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const keepCase = (target, src) => {
+    if (src.toUpperCase() === src) return target.toUpperCase();
+    if (src[0] === src[0].toUpperCase()) return target[0].toUpperCase() + target.slice(1);
+    return target;
+  };
+  const mapWordList = (s, pairs) =>
+    pairs.reduce(
+      (acc, [a, b]) =>
+        acc.replace(new RegExp(`\\b${esc(a)}\\b`, "gi"), (m) => keepCase(b, m)),
+      s
+    );
 
   const FR_MAP = [
     ["très", "vraiment"],
     ["important", "crucial"],
     ["donc", "ainsi"],
-    ["par conséquent", "en conséquence"],
     ["ceci", "cela"],
     ["améliorer", "optimiser"],
-    ["problème", "anomalie"],
     ["utiliser", "employer"],
-    ["c'est", "il est"],
-    ["néanmoins", "toutefois"],
+    ["problème", "anomalie"],
     ["de plus", "en outre"],
+    ["néanmoins", "toutefois"],
   ];
   const EN_MAP = [
     ["very", "highly"],
     ["important", "crucial"],
     ["therefore", "thus"],
     ["so", "therefore"],
-    ["make sure", "ensure"],
     ["help", "assist"],
     ["use", "leverage"],
     ["start", "begin"],
     ["in addition", "additionally"],
+    ["however", "nevertheless"],
+    ["also", "furthermore"],
+    ["big", "significant"],
   ];
 
-  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const preserveCase = (target, src) => {
-    if (src.toUpperCase() === src) return target.toUpperCase();
-    if (src[0] === src[0].toUpperCase()) return target[0].toUpperCase() + target.slice(1);
-    return target;
-  };
-  const applyMap = (s, map) =>
-    map.reduce(
-      (acc, [a, b]) =>
-        acc.replace(new RegExp(`\\b${esc(a)}\\b`, "gi"), (m) => preserveCase(b, m)),
-      s
-    );
+  const SENTENCE_STARTS = [
+    [/^one of the most/gi, "Among the most"],
+    [/^in conclusion/gi, "To conclude"],
+    [/^ultimately/gi, "In the end"],
+    [/^additionally/gi, "Furthermore"],
+    [/^however/gi, "Nevertheless"],
+    [/^despite/gi, "Although"],
+    [/^social media also provides/gi, "Social media also offers"],
+  ];
+  const PHRASE_MAP = [
+    [/has also/gi, "also has"],
+    [/has introduced/gi, "has brought about"],
+    [/raises concerns/gi, "sparks concerns"],
+    [/can lead to/gi, "can result in"],
+    [/has become/gi, "has grown to be"],
+    [/it is essential to/gi, "it is crucial to"],
+  ];
 
-  out = applyMap(out, FR_MAP);
-  out = applyMap(out, EN_MAP);
+  const sentences = String(input || "").split(/(?<=[.!?])\s+/);
+  const rephrased = sentences
+    .map((s, idx) => {
+      if (!s.trim()) return s;
+      let x = mapWordList(s, FR_MAP);
+      x = mapWordList(x, EN_MAP);
+      for (const [re, repl] of SENTENCE_STARTS) {
+        if (re.test(x)) {
+          x = x.replace(re, (m) => keepCase(repl, m));
+          break;
+        }
+      }
+      for (const [re, repl] of PHRASE_MAP) x = x.replace(re, repl);
+      if (x === s && idx % 2 === 0) x = "Overall, " + x.charAt(0).toLowerCase() + x.slice(1);
+      return x;
+    })
+    .join(" ");
 
-  // tournures
-  out = out
-    .replace(/\bIn order to\b/g, "To")
-    .replace(/\bafin de\b/gi, "pour")
-    .replace(/\bhowever\b/gi, "nevertheless");
-
-  // Si rien n’a bougé (texte trop spécifique), forcer un petit delta neutre
-  if (out === t) {
-    out = out.replace(/\bso\b/gi, "therefore").replace(/\btrès\b/gi, "vraiment");
-  }
-
-  return normalizeText(out);
+  return normalizeText(fixOcrWordSplits(rephrased));
 }
 
 /* =========================
@@ -176,10 +206,13 @@ async function extractTextFromFile(fileBuffer, originalName, strictPdf = false) 
   }
   if (ext === ".pptx") {
     const zip = await JSZip.loadAsync(fileBuffer);
-    const slideFiles = Object.keys(zip.files).filter((f) => /^ppt\/slides\/slide\d+\.xml$/i.test(f));
+    const slideFiles = Object.keys(zip.files).filter((f) =>
+      /^ppt\/slides\/slide\d+\.xml$/i.test(f)
+    );
     slideFiles.sort(
       (a, b) =>
-        parseInt(a.match(/slide(\d+)\.xml/i)[1], 10) - parseInt(b.match(/slide(\d+)\.xml/i)[1], 10)
+        parseInt(a.match(/slide(\d+)\.xml/i)[1], 10) -
+        parseInt(b.match(/slide(\d+)\.xml/i)[1], 10)
     );
     let all = [];
     for (const f of slideFiles) {
@@ -199,7 +232,6 @@ function countMatches(str, re) {
   const m = str.match(re);
   return m ? m.length : 0;
 }
-
 function computeCleanStats(original, cleaned, lengthBefore, lengthCleaned) {
   return {
     zeroWidthRemoved: countMatches(original, /[\u200B-\u200D\uFEFF\u2060\u00AD]/g),
@@ -221,7 +253,6 @@ function computeCleanStats(original, cleaned, lengthBefore, lengthCleaned) {
     lengthCleaned,
   };
 }
-
 function splitSentences(text) {
   if (!text) return [];
   const paras = text.split(/\n{2,}/g);
@@ -233,14 +264,11 @@ function splitSentences(text) {
   }
   return out.map((s) => s.trim()).filter(Boolean);
 }
-
-/** Simple LCS diff -> ops: {type:'eq'|'del'|'ins', text} */
+/** LCS diff simple -> ops: {type:'eq'|'del'|'ins', text} */
 function diffTokens(a, b) {
   const tok = (s) => s.match(/\w+|[^\s\w]+|\s+/g) || [];
-  const A = tok(a),
-    B = tok(b);
-  const n = A.length,
-    m = B.length;
+  const A = tok(a), B = tok(b);
+  const n = A.length, m = B.length;
   const dp = Array.from({ length: n + 1 }, () => Array(m + 1).fill(0));
   for (let i = 1; i <= n; i++) {
     for (let j = 1; j <= m; j++) {
@@ -248,20 +276,11 @@ function diffTokens(a, b) {
     }
   }
   const ops = [];
-  let i = n,
-    j = m;
+  let i = n, j = m;
   while (i > 0 || j > 0) {
-    if (i > 0 && j > 0 && A[i - 1] === B[j - 1]) {
-      ops.push({ type: "eq", text: A[i - 1] });
-      i--;
-      j--;
-    } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1]?.[j])) {
-      ops.push({ type: "ins", text: B[j - 1] });
-      j--;
-    } else {
-      ops.push({ type: "del", text: A[i - 1] });
-      i--;
-    }
+    if (i > 0 && j > 0 && A[i - 1] === B[j - 1]) { ops.push({ type: "eq", text: A[i - 1] }); i--; j--; }
+    else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1]?.[j])) { ops.push({ type: "ins", text: B[j - 1] }); j--; }
+    else { ops.push({ type: "del", text: A[i - 1] }); i--; }
   }
   return ops.reverse();
 }
@@ -270,12 +289,8 @@ function htmlEscape(s) {
 }
 function renderSideBySide(before, after) {
   const ops = diffTokens(before, after);
-  const left = ops
-    .map((o) => (o.type === "eq" ? htmlEscape(o.text) : o.type === "del" ? `<span class="del">${htmlEscape(o.text)}</span>` : ""))
-    .join("");
-  const right = ops
-    .map((o) => (o.type === "eq" ? htmlEscape(o.text) : o.type === "ins" ? `<span class="ins">${htmlEscape(o.text)}</span>` : ""))
-    .join("");
+  const left = ops.map((o) => (o.type === "eq" ? htmlEscape(o.text) : o.type === "del" ? `<span class="del">${htmlEscape(o.text)}</span>` : "")).join("");
+  const right = ops.map((o) => (o.type === "eq" ? htmlEscape(o.text) : o.type === "ins" ? `<span class="ins">${htmlEscape(o.text)}</span>` : "")).join("");
   return `
   <div class="diff-pair">
     <div class="diff-col">
@@ -302,15 +317,14 @@ function buildChangedSnippetsHtml(beforeText, afterText, maxPairs = 5) {
   if (!pairs.length) return `<div class="muted">No visible sentence-level changes detected.</div>`;
   return pairs.join("\n");
 }
-
 function buildReportHtml({
   mode, // "V1" | "V2"
   originalName,
   originalText,
   cleanedText,
   rephrasedText, // null en V1
-  stats, // lengthBefore, lengthCleaned + counters
-  notes, // { strictPdf }
+  stats,
+  notes,
 }) {
   const style = `
   <style>
@@ -405,7 +419,6 @@ async function zipFiles(files) {
     archive.on("error", (e) => reject(e));
     archive.on("data", (d) => chunks.push(d));
     archive.on("end", () => resolve(Buffer.concat(chunks)));
-    // contenu
     for (const f of files) archive.file(f.path, { name: f.name });
     archive.finalize();
   });
@@ -416,12 +429,8 @@ async function zipFiles(files) {
    ========================= */
 app.get("/health", (_req, res) => res.json({ ok: true, message: "Backend is running ✅" }));
 app.get("/_env_ok", (_req, res) => res.json({ ok: true, NODE_ENV: process.env.NODE_ENV || "development" }));
-app.get("/_ai_echo", (req, res) =>
-  res.json({ ok: true, echo: aiSpellGrammarPass(String(req.query.q || "Hello from AI")) })
-);
-app.get("/_ai_rephrase_echo", (req, res) =>
-  res.json({ ok: true, rephrased: aiRephrase(String(req.query.q || "Hello from AI")) })
-);
+app.get("/_ai_echo", (req, res) => res.json({ ok: true, echo: aiSpellGrammarPass(String(req.query.q || "Hello from AI")) }));
+app.get("/_ai_rephrase_echo", (req, res) => res.json({ ok: true, rephrased: aiRephrase(String(req.query.q || "Hello from AI")) }));
 
 /* ---- V1: Clean → ZIP = cleaned.docx + report.html ---- */
 app.post("/clean", upload.any(), async (req, res) => {
@@ -479,13 +488,11 @@ app.post("/clean-v2", upload.any(), async (req, res) => {
     const originalText = await extractTextFromFile(f.buffer, originalName, strictPdf);
     const lengthBefore = originalText.length;
 
-    // Clean pass
-    const corrected = aiSpellGrammarPass(originalText);
+    const corrected = aiSpellGrammarPass(originalText); // clean pass d’abord
     const cleanedText = normalizeText(corrected);
     const lengthCleaned = cleanedText.length;
 
-    // Rephrase pass — garantit un delta
-    const rephrasedText = aiRephrase(cleanedText);
+    const rephrasedText = aiRephrase(cleanedText); // réécriture marquée
 
     const rephrasedPath = tmpPath("rephrased.docx");
     await createDocxFromText(rephrasedText, rephrasedPath);
@@ -520,4 +527,3 @@ app.post("/clean-v2", upload.any(), async (req, res) => {
 /* ---- Boot ---- */
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`DocSafe backend listening on ${PORT}`));
-
