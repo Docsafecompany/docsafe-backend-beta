@@ -53,30 +53,6 @@ app.get('/_env_ok', (_req, res) => {
   });
 });
 
-// IA diagnostics
-app.get('/_ai_echo', async (_req, res) => {
-  try {
-    const sample = 'soc ial enablin g commu nication, dis   connection.';
-    const proof = await aiProofread(sample);
-    res.json({ ok: true, in: sample, proof });
-  } catch (e) {
-    console.error('AI_ECHO ERROR', e);
-    res.status(500).json({ ok: false, where: '_ai_echo', error: e?.message || String(e) });
-  }
-});
-
-app.get('/_ai_rephrase_echo', async (_req, res) => {
-  try {
-    const sample = 'Notre solution réduit fortement les erreurs et améliore la qualité des documents. Elle s’intègre facilement aux outils existants.';
-    const proof = await aiProofread(sample);
-    const reph = await aiRephrase(proof || sample);
-    res.json({ ok: true, in: sample, proof, rephrase: reph });
-  } catch (e) {
-    console.error('AI_REPHRASE_ECHO ERROR', e);
-    res.status(500).json({ ok: false, where: '_ai_rephrase_echo', error: e?.message || String(e) });
-  }
-});
-
 /**
  * mode:
  *  - 'v1' => nettoyage + orthographe IA (sans reformulation)
@@ -95,10 +71,16 @@ async function processFile({ buffer, filename, strictPdf = false, mode = 'v1' })
   if (mime === 'application/pdf' || ext === '.pdf') {
     const { outBuffer, text } = await cleanPDF(buffer, { strict: strictPdf });
     cleanedBuffer = outBuffer; extractedText = text || '';
-  } else if (mime === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || ext === '.docx') {
+  } else if (
+    mime === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' ||
+    ext === '.docx'
+  ) {
     const { outBuffer, text } = await cleanDOCX(buffer);
     cleanedBuffer = outBuffer; extractedText = text || '';
-  } else if (mime === 'application/vnd.openxmlformats-officedocument.presentationml.presentation' || ext === '.pptx') {
+  } else if (
+    mime === 'application/vnd.openxmlformats-officedocument.presentationml.presentation' ||
+    ext === '.pptx'
+  ) {
     const { outBuffer, text } = await cleanPPTX(buffer);
     cleanedBuffer = outBuffer; extractedText = text || '';
   } else {
@@ -110,7 +92,8 @@ async function processFile({ buffer, filename, strictPdf = false, mode = 'v1' })
 
   // LanguageTool optionnel
   if (process.env.LT_ENDPOINT) {
-    try { ltResult = await ltCheck(normalized); } catch (e) { console.warn('LT error', e?.message || e); ltResult = null; }
+    try { ltResult = await ltCheck(normalized); }
+    catch (e) { console.warn('LT error', e?.message || e); ltResult = null; }
   }
 
   // --- IA ---
@@ -124,9 +107,6 @@ async function processFile({ buffer, filename, strictPdf = false, mode = 'v1' })
     console.error('aiProofread error', e);
     proofText = null;
   }
-
-  // Si tu veux “fail-fast”, décommente :
-  // if (!proofText) throw new Error('AI proofread unavailable (check OPENAI_API_KEY/provider).');
 
   // V2: reformulation (sur le texte corrigé si dispo)
   if (mode === 'v2') {
@@ -166,6 +146,37 @@ async function processFile({ buffer, filename, strictPdf = false, mode = 'v1' })
   const zipBuffer = await zipOutput(files);
   return zipBuffer;
 }
+
+// === Routes DIAG tolérantes (pas de 500 si rate-limit) ===
+app.get('/_ai_echo', async (_req, res) => {
+  try {
+    const sample = 'soc ial enablin g commu nication, dis   connection.';
+    const proof = await aiProofread(sample);
+    if (!proof) {
+      return res.json({ ok: false, where: '_ai_echo', notice: 'AI unavailable (rate-limited or error)', proof: null });
+    }
+    res.json({ ok: true, in: sample, proof });
+  } catch (e) {
+    console.error('AI_ECHO ERROR', e);
+    res.json({ ok: false, where: '_ai_echo', error: e?.message || String(e) });
+  }
+});
+
+app.get('/_ai_rephrase_echo', async (_req, res) => {
+  try {
+    const sample = 'Notre solution réduit fortement les erreurs et améliore la qualité des documents. Elle s’intègre facilement aux outils existants.';
+    const proof = await aiProofread(sample);
+    const base = proof || sample;
+    const reph = await aiRephrase(base);
+    if (!reph) {
+      return res.json({ ok: false, where: '_ai_rephrase_echo', notice: 'AI unavailable (rate-limited or error)', proof, rephrase: null });
+    }
+    res.json({ ok: true, in: sample, proof, rephrase: reph });
+  } catch (e) {
+    console.error('AI_REPHRASE_ECHO ERROR', e);
+    res.json({ ok: false, where: '_ai_rephrase_echo', error: e?.message || String(e) });
+  }
+});
 
 // --- Routes principales ---
 app.post('/clean', upload.single('file'), async (req, res) => {
