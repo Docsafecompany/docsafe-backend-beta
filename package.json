@@ -1,7 +1,7 @@
 {
   "name": "docsafe-backend-beta",
   "version": "1.0.0",
-  "description": "DocSafe backend (Render, Express, ZIP, PDF/DOCX/PPTX)",
+  "description": "DocSafe backend (Render, Express, ZIP, PDF/DOCX/PPTX, structure-preserving edits)",
   "type": "module",
   "engines": { "node": ">=20 <23" },
   "scripts": {
@@ -16,7 +16,6 @@
     "jszip": "^3.10.1",
     "multer": "^1.4.5-lts.1",
     "pdf-parse": "^1.1.1",
-    "nspell": "^2.3.4",
-    "dictionary-en-us": "^4.0.0"
+    "pdf-lib": "^1.17.1"
   }
 }
