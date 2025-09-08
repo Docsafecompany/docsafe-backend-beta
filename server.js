@@ -362,5 +362,54 @@ app.post("/_office_test", upload.single("file"), async (req, res) => {
 
 // ----------------- Listen -----------------
 const PORT = process.env.PORT || 10000;
+// ===== FORMS (test depuis le navigateur) =====
+app.get("/_test", (_, res) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.end(`<!doctype html>
+<html><head><meta charset="utf-8"><title>DocSafe Test</title>
+<style>body{font-family:system-ui;margin:24px;line-height:1.4} fieldset{margin:16px 0;padding:12px}</style>
+</head><body>
+  <h1>DocSafe — Formulaires de test</h1>
+
+  <fieldset>
+    <legend>/_docx_probe2 (POST)</legend>
+    <form action="/_docx_probe2" method="post" enctype="multipart/form-data" target="_blank">
+      <input type="file" name="file" accept=".docx" required>
+      <button type="submit">Tester _docx_probe2</button>
+    </form>
+    <p>Renvoie nombre de paragraphes modifiés.</p>
+  </fieldset>
+
+  <fieldset>
+    <legend>/clean (POST) — V1</legend>
+    <form action="/clean" method="post" enctype="multipart/form-data">
+      <input type="file" name="file" accept=".docx,.pptx,.pdf" required>
+      <label style="margin-left:8px;">
+        <input type="checkbox" name="strictPdf" value="true"> strictPdf
+      </label>
+      <button type="submit">Lancer V1</button>
+    </form>
+    <p>Télécharge un ZIP (cleaned.* + report.html).</p>
+  </fieldset>
+
+  <fieldset>
+    <legend>/clean-v2 (POST) — V2</legend>
+    <form action="/clean-v2" method="post" enctype="multipart/form-data">
+      <input type="file" name="file" accept=".docx,.pptx,.pdf" required>
+      <label style="margin-left:8px;">
+        <input type="checkbox" name="strictPdf" value="true"> strictPdf
+      </label>
+      <button type="submit">Lancer V2</button>
+    </form>
+    <p>Télécharge un ZIP (cleaned.* + rephrased.* + report.html).</p>
+  </fieldset>
+</body></html>`);
+});
+
+// (optionnel) messages clairs si on tente GET sur des routes POST
+app.get("/clean", (_, res) => res.status(405).send('Use POST multipart/form-data. Astuce: ouvrez /_test'));
+app.get("/clean-v2", (_, res) => res.status(405).send('Use POST multipart/form-data. Astuce: ouvrez /_test'));
+app.get("/_docx_probe2", (_, res) => res.status(405).send('Use POST multipart/form-data. Astuce: ouvrez /_test'));
+
 app.listen(PORT, () => console.log(`DocSafe backend listening on ${PORT}`));
 
