@@ -19,25 +19,52 @@ app.use(cors({ origin: "*", credentials: false }));
 app.use(express.json({ limit: "32mb" }));
 app.use(express.urlencoded({ extended: true, limit: "32mb" }));
 
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 50 * 1024 * 1024 },
+});
 
 // =============== IA: correction & reformulation (ULTRA-CONSERVATEUR) ===============
 
+// Lissage espaces/ponctuation — NE COLLE PAS les mots
 function safeNormalizeSpaces(raw) {
   if (!raw) return "";
   let t = String(raw);
+
+  // Unifier fins de ligne + trim par ligne
   t = t.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-  t = t.replace(/[ \t]{2,}/g, " ");                 // compacter espaces
-  t = t.replace(/\s+([:;!?)\]\}])/g, "$1");         // pas d’espace avant : ; ! ? ) ] }
-  t = t.replace(/([.:;!?])([A-Za-z0-9])/g, "$1 $2");// espace après . : ; ! ? si lettre/num
-  t = t.replace(/\n{3,}/g, "\n\n");                  // paragraphes
+  t = t
+    .split("\n")
+    .map((l) => l.replace(/[ \t]+$/g, "").replace(/^[ \t]+/g, ""))
+    .join("\n");
+
+  // Compacter espaces multiples (hors sauts de ligne)
+  t = t.replace(/[ \t]{2,}/g, " ");
+
+  // Virgules : pas d'espace avant, 1 espace après si lettre/num suit
+  t = t.replace(/\s+,/g, ",");
+  t = t.replace(/,([^\s\n])/g, ", $1");
+
+  // Pas d’espace AVANT : ; ! ? ) ] }
+  t = t.replace(/\s+([:;!?)\]\}])/g, "$1");
+
+  // Espace APRÈS . : ; ! ? si lettre/num suit
+  t = t.replace(/([.:;!?])([A-Za-z0-9])/g, "$1 $2");
+
+  // Dé-dupliquer ponctuation (,, ;; :: !! ?? @@ → un seul)
+  t = t.replace(/([.,;:!?@])\1+/g, "$1");
+
+  // Paragraphes : max 1 ligne vide
+  t = t.replace(/\n{3,}/g, "\n\n");
+
   return t.trim();
 }
 
+// Corrections ciblées des artefacts réellement observés (ne JAMAIS fusionner des mots normaux)
 function fixObservedArtifacts(text) {
   let t = text;
 
-  // Artefacts intra-mot (observés dans tes fichiers) : soc ial, enablin g, th e, corpo, rations, rig hts…
+  // Espaces intra-mot récurrents
   t = t.replace(/\bsoc\s+ial\b/gi, "social");
   t = t.replace(/\bcommu\s+nication\b/gi, "communication");
   t = t.replace(/\benablin\s+g\b/gi, "enabling");
@@ -46,11 +73,17 @@ function fixObservedArtifacts(text) {
   t = t.replace(/\bdis\s+connection\b/gi, "disconnection");
   t = t.replace(/\brig\s+hts\b/gi, "rights");
   t = t.replace(/\bco\s+mmunication\b/gi, "communication");
-  t = t.replace(/\b([A-Za-z])\s{2,}([A-Za-z]+)\b/g, (_m, a, rest) => a + rest); // p  otential -> potential
-  t = t.replace(/\b([a-z])\1{2,}([a-z]+)/g, (_m, a, rest) => a + rest);         // gggdigital -> digital
-  t = t.replace(/\bcorpo,\s*rations\b/gi, "corporations");                       // corpo, rations -> corporations
 
-  // Suffixes scindés par ESPACE (jamais via virgule/point)
+  // Espaces multiples à l’intérieur d’un mot (ex: "p  otential")
+  t = t.replace(/\b([A-Za-z])\s{2,}([A-Za-z]+)\b/g, (_m, a, rest) => a + rest);
+
+  // Lettres bruitées en tête (gggdigital -> digital)
+  t = t.replace(/\b([a-z])\1{2,}([a-z]+)/g, (_m, a, rest) => a + rest);
+
+  // "corpo, rations" -> "corporations" (sans toucher aux autres virgules)
+  t = t.replace(/\bcorpo,\s*rations\b/gi, "corporations");
+
+  // Suffixes scindés par ESPACE (jamais via virgule/point) — conservateur
   t = t.replace(
     /\b([A-Za-z]{3,})\s+(tion|sion|ment|ness|ship|ance|ence|hood|ward|tial|cial|ing|ed|ly)\b/g,
     (_m, a, suf) => a + suf
@@ -63,6 +96,7 @@ function sanitizeText(raw) {
   let t = String(raw);
   t = fixObservedArtifacts(t);
 
+  // Normalisations lexicales sûres
   t = t
     .replace(/\bTik,?\s*Tok\b/gi, "TikTok")
     .replace(/\bLinked,?\s*In\b/gi, "LinkedIn")
@@ -75,7 +109,7 @@ function sanitizeText(raw) {
   return t;
 }
 
-// V1 — correction seulement
+// V1 — correction uniquement
 async function aiCorrectGrammar(text) {
   return sanitizeText(text);
 }
@@ -83,10 +117,12 @@ async function aiCorrectGrammar(text) {
 // V2 — reformulation légère (pas de synonymes risqués, pas de collage)
 async function aiRephrase(text) {
   let t = await aiCorrectGrammar(text);
-  t = t.replace(/\bOverall,?\s+(?=[A-Za-z])/g, "");
+  t = t.replace(/\bOverall,?\s+(?=[A-Za-z])/g, ""); // retire "Overall, "
   t = t.replace(/\bFurthermore,?\s+/g, "Moreover, ");
+  t = t.replace(/\bIn conclusion,?\s+/gi, "To conclude, ");
+  // Couper les pavés après ";"
   t = t.replace(/;(\s+)/g, ". ");
-  return sanitizeText(t);
+  return safeNormalizeSpaces(t);
 }
 
 // =============== Helpers ===============
@@ -100,6 +136,11 @@ async function transformOfficeBuffer(buffer, ext, transformFn) {
   if (ext === "docx") return await processDocxBuffer(buffer, transformFn);
   if (ext === "pptx") return await processPptxBuffer(buffer, transformFn);
   throw new Error("Unsupported office type: " + ext);
+}
+
+// Si un seul fichier, on met à la racine; si plusieurs, on préfixe pour éviter les collisions.
+function outName(single, base, name) {
+  return single ? name : `${base}_${name}`;
 }
 
 // =============== Health / Echo ===============
@@ -124,27 +165,33 @@ app.get("/_ai_rephrase_echo", async (req, res) => {
 app.post("/clean", upload.any(), async (req, res) => {
   try {
     const strictPdf = String(req.body.strictPdf || "false") === "true";
-    if (!req.files?.length) return res.status(400).json({ error: "No files uploaded." });
+    const files = req.files || [];
+    if (!files.length) return res.status(400).json({ error: "No files uploaded." });
 
+    const single = files.length === 1;
     const zip = new AdmZip();
 
-    for (const f of req.files) {
+    for (const f of files) {
       const ext = getExt(f.originalname);
       const base = path.parse(f.originalname).name;
 
       if (ext === "docx" || ext === "pptx") {
         const cleanedBuf = await transformOfficeBuffer(f.buffer, ext, aiCorrectGrammar);
-        zip.addFile(`${base}/cleaned.${ext}`, cleanedBuf);
-        zip.addFile(`${base}/report.html`, Buffer.from(
-          buildReportHtml({
-            original: "[structured file]",
-            cleaned: "[structured file corrected]",
-            rephrased: null,
-            filename: f.originalname,
-            mode: "V1",
-          }),
-          "utf8"
-        ));
+
+        zip.addFile(outName(single, base, `cleaned.${ext}`), cleanedBuf);
+        zip.addFile(
+          outName(single, base, `report.html`),
+          Buffer.from(
+            buildReportHtml({
+              original: "[structured file]",
+              cleaned: "[structured file corrected]",
+              rephrased: null,
+              filename: f.originalname,
+              mode: "V1",
+            }),
+            "utf8"
+          )
+        );
       } else if (ext === "pdf") {
         const pdfSan = await stripPdfMetadata(f.buffer);
         const rawText = await extractPdfText(pdfSan);
@@ -152,27 +199,46 @@ app.post("/clean", upload.any(), async (req, res) => {
         const cleaned = await aiCorrectGrammar(filtered);
         const cleanedDocx = await createDocxFromText(cleaned, base || "cleaned");
 
-        zip.addFile(`${base}/pdf_sanitized.pdf`, pdfSan);
-        zip.addFile(`${base}/cleaned.docx`, cleanedDocx);
-        zip.addFile(`${base}/report.html`, Buffer.from(
-          buildReportHtml({ original: filtered, cleaned, rephrased: null, filename: f.originalname, mode: "V1" }),
-          "utf8"
-        ));
+        zip.addFile(outName(single, base, `pdf_sanitized.pdf`), pdfSan);
+        zip.addFile(outName(single, base, `cleaned.docx`), cleanedDocx);
+        zip.addFile(
+          outName(single, base, `report.html`),
+          Buffer.from(
+            buildReportHtml({
+              original: filtered,
+              cleaned,
+              rephrased: null,
+              filename: f.originalname,
+              mode: "V1",
+            }),
+            "utf8"
+          )
+        );
       } else {
+        // Fallback texte brut
         const original = f.buffer.toString("utf8");
         const cleaned = await aiCorrectGrammar(original);
         const cleanedDocx = await createDocxFromText(cleaned, base || "cleaned");
 
-        zip.addFile(`${base}/cleaned.docx`, cleanedDocx);
-        zip.addFile(`${base}/report.html`, Buffer.from(
-          buildReportHtml({ original, cleaned, rephrased: null, filename: f.originalname, mode: "V1" }),
-          "utf8"
-        ));
+        zip.addFile(outName(single, base, `cleaned.docx`), cleanedDocx);
+        zip.addFile(
+          outName(single, base, `report.html`),
+          Buffer.from(
+            buildReportHtml({
+              original,
+              cleaned,
+              rephrased: null,
+              filename: f.originalname,
+              mode: "V1",
+            }),
+            "utf8"
+          )
+        );
       }
     }
 
     res.setHeader("Content-Type", "application/zip");
-    res.setHeader("Content-Disposition", `attachment; filename="docsafe_v1.zip"`);
+    res.setHeader("Content-Disposition", `attachment; filename="docsafe_v1_result.zip"`);
     return res.send(zip.toBuffer());
   } catch (err) {
     console.error("CLEAN ERROR", err);
@@ -185,11 +251,13 @@ app.post("/clean", upload.any(), async (req, res) => {
 app.post("/clean-v2", upload.any(), async (req, res) => {
   try {
     const strictPdf = String(req.body.strictPdf || "false") === "true";
-    if (!req.files?.length) return res.status(400).json({ error: "No files uploaded." });
+    const files = req.files || [];
+    if (!files.length) return res.status(400).json({ error: "No files uploaded." });
 
+    const single = files.length === 1;
     const zip = new AdmZip();
 
-    for (const f of req.files) {
+    for (const f of files) {
       const ext = getExt(f.originalname);
       const base = path.parse(f.originalname).name;
 
@@ -197,18 +265,21 @@ app.post("/clean-v2", upload.any(), async (req, res) => {
         const cleanedBuf = await transformOfficeBuffer(f.buffer, ext, aiCorrectGrammar);
         const rephrasedBuf = await transformOfficeBuffer(f.buffer, ext, aiRephrase);
 
-        zip.addFile(`${base}/cleaned.${ext}`, cleanedBuf);
-        zip.addFile(`${base}/rephrased.${ext}`, rephrasedBuf);
-        zip.addFile(`${base}/report.html`, Buffer.from(
-          buildReportHtml({
-            original: "[structured file]",
-            cleaned: "[structured file corrected]",
-            rephrased: "[structured file rephrased]",
-            filename: f.originalname,
-            mode: "V2",
-          }),
-          "utf8"
-        ));
+        zip.addFile(outName(single, base, `cleaned.${ext}`), cleanedBuf);
+        zip.addFile(outName(single, base, `rephrased.${ext}`), rephrasedBuf);
+        zip.addFile(
+          outName(single, base, `report.html`),
+          Buffer.from(
+            buildReportHtml({
+              original: "[structured file]",
+              cleaned: "[structured file corrected]",
+              rephrased: "[structured file rephrased]",
+              filename: f.originalname,
+              mode: "V2",
+            }),
+            "utf8"
+          )
+        );
       } else if (ext === "pdf") {
         const pdfSan = await stripPdfMetadata(f.buffer);
         const rawText = await extractPdfText(pdfSan);
@@ -220,31 +291,50 @@ app.post("/clean-v2", upload.any(), async (req, res) => {
         const cleanedDocx = await createDocxFromText(cleaned, base || "cleaned");
         const rephrasedDocx = await createDocxFromText(rephrased, base || "rephrased");
 
-        zip.addFile(`${base}/pdf_sanitized.pdf`, pdfSan);
-        zip.addFile(`${base}/cleaned.docx`, cleanedDocx);
-        zip.addFile(`${base}/rephrased.docx`, rephrasedDocx);
-        zip.addFile(`${base}/report.html`, Buffer.from(
-          buildReportHtml({ original: filtered, cleaned, rephrased, filename: f.originalname, mode: "V2" }),
-          "utf8"
-        ));
+        zip.addFile(outName(single, base, `pdf_sanitized.pdf`), pdfSan);
+        zip.addFile(outName(single, base, `cleaned.docx`), cleanedDocx);
+        zip.addFile(outName(single, base, `rephrased.docx`), rephrasedDocx);
+        zip.addFile(
+          outName(single, base, `report.html`),
+          Buffer.from(
+            buildReportHtml({
+              original: filtered,
+              cleaned,
+              rephrased,
+              filename: f.originalname,
+              mode: "V2",
+            }),
+            "utf8"
+          )
+        );
       } else {
+        // Fallback texte brut
         const original = f.buffer.toString("utf8");
         const cleaned = await aiCorrectGrammar(original);
         const rephrased = await aiRephrase(cleaned);
         const cleanedDocx = await createDocxFromText(cleaned, base || "cleaned");
         const rephrasedDocx = await createDocxFromText(rephrased, base || "rephrased");
 
-        zip.addFile(`${base}/cleaned.docx`, cleanedDocx);
-        zip.addFile(`${base}/rephrased.docx`, rephrasedDocx);
-        zip.addFile(`${base}/report.html`, Buffer.from(
-          buildReportHtml({ original, cleaned, rephrased, filename: f.originalname, mode: "V2" }),
-          "utf8"
-        ));
+        zip.addFile(outName(single, base, `cleaned.docx`), cleanedDocx);
+        zip.addFile(outName(single, base, `rephrased.docx`), rephrasedDocx);
+        zip.addFile(
+          outName(single, base, `report.html`),
+          Buffer.from(
+            buildReportHtml({
+              original,
+              cleaned,
+              rephrased,
+              filename: f.originalname,
+              mode: "V2",
+            }),
+            "utf8"
+          )
+        );
       }
     }
 
     res.setHeader("Content-Type", "application/zip");
-    res.setHeader("Content-Disposition", `attachment; filename="docsafe_v2.zip"`);
+    res.setHeader("Content-Disposition", `attachment; filename="docsafe_v2_result.zip"`);
     return res.send(zip.toBuffer());
   } catch (err) {
     console.error("CLEAN V2 ERROR", err);
@@ -267,7 +357,7 @@ app.post("/_pdf_test", upload.single("file"), async (req, res) => {
       size: req.file.size,
       rawLength: rawText.length,
       filteredLength: filtered.length,
-      excerpt: filtered.slice(0, 500)
+      excerpt: filtered.slice(0, 500),
     });
   } catch (e) {
     console.error("DEBUG _pdf_test error:", e);
@@ -296,7 +386,7 @@ app.post("/_office_test", upload.single("file"), async (req, res) => {
   }
 });
 
-// =============== Listen ===============
-
+// =============== Server listen ===============
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`DocSafe backend listening on ${PORT}`));
+
