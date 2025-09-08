@@ -225,6 +225,25 @@ app.post("/_office_test", upload.single("file"), async (req, res) => {
 });
 
 const PORT = process.env.PORT || 10000;
+// ===== DEBUG PROBE: pour vérifier qu'un DOCX est bien modifié =====
+app.post("/_docx_probe", upload.single("file"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "No DOCX uploaded" });
+    const buf = req.file.buffer;
+    const before = buf.length;
+    const out = await processDocxBuffer(buf, "V1");
+    const after = out.length;
+    res.json({
+      filename: req.file.originalname,
+      size_in: before,
+      size_out: after,
+      changed: before !== after
+    });
+  } catch (e) {
+    console.error("DEBUG _docx_probe error:", e);
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
 app.listen(PORT, () => console.log(`DocSafe backend listening on ${PORT}`));
 
 
