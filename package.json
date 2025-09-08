@@ -1,18 +1,21 @@
 {
   "name": "docsafe-backend-beta",
   "version": "1.0.0",
-  "private": true,
-  "type": "commonjs",
-  "main": "server.js",
-  "engines": { "node": ">=18 <23" },
-  "scripts": { "start": "node server.js" },
+  "description": "DocSafe backend (Render, Express, ZIP, PDF/DOCX/PPTX)",
+  "type": "module",
+  "engines": {
+    "node": ">=20 <23"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "NODE_ENV=development node server.js"
+  },
   "dependencies": {
-    "archiver": "^6.0.2",
+    "adm-zip": "^0.5.10",
     "cors": "^2.8.5",
     "docx": "^8.5.0",
     "express": "^4.19.2",
     "jszip": "^3.10.1",
-    "mammoth": "^1.7.1",
     "multer": "^1.4.5-lts.1",
     "pdf-parse": "^1.1.1"
   }
