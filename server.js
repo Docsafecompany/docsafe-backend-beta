@@ -23,7 +23,7 @@ app.use(
     allowedHeaders: ["Content-Type", "Accept", "Origin"],
   })
 );
-app.options("*", cors()); // préflights
+app.options("*", cors()); // préflights explicites
 
 const upload = multer({ storage: multer.memoryStorage() });
 
@@ -34,17 +34,23 @@ const upload = multer({ storage: multer.memoryStorage() });
 // Normalisation forte FR/EN (espaces, ponctuation, doublons, retours)
 function normalizeText(input) {
   let t = String(input || "");
-  t = t.replace(/[\u200B-\u200D\uFEFF\u2060\u00AD]/g, "").replace(/\r\n/g, "\n"); // invisibles + CRLF
-  t = t.replace(/[ \t]+/g, " ");                  // espaces multiples
-  t = t.replace(/([.,;:!?@])\s*\1+/g, "$1");      // ponctuation dupliquée
-  t = t.replace(/…+/g, "…");                      // ellipses
-  t = t.replace(/\s+([.,;:!?%])/g, "$1");         // pas d’espace AVANT
-  t = t.replace(/([.,;:!?%])(?!\s|$)/g, "$1 ");   // 1 espace APRÈS
+  // invisibles + CRLF
+  t = t.replace(/[\u200B-\u200D\uFEFF\u2060\u00AD]/g, "").replace(/\r\n/g, "\n");
+  // espaces multiples -> 1
+  t = t.replace(/[ \t]+/g, " ");
+  // ponctuation dupliquée + ellipses
+  t = t.replace(/([.,;:!?@])\s*\1+/g, "$1").replace(/…+/g, "…");
+  // pas d’espace AVANT ; exactement 1 APRÈS
+  t = t.replace(/\s+([.,;:!?%])/g, "$1");
+  t = t.replace(/([.,;:!?%])(?!\s|$)/g, "$1 ");
   t = t.replace(/[ \t]{2,}/g, " ");
-  t = t.replace(/\s*\(\s*/g, " (").replace(/\s*\)\s*/g, ") "); // () serrées
+  // () et " "
+  t = t.replace(/\s*\(\s*/g, " (").replace(/\s*\)\s*/g, ") ");
   t = t.replace(/\s*"\s*/g, '"');
-  t = t.replace(/\n[ \t]*\n[ \t]*(\n[ \t]*)+/g, "\n\n");        // max 1 ligne vide
-  t = t.split("\n").map((s) => s.replace(/[ \t]+$/g, "")).join("\n"); // trim fin de ligne
+  // lignes vides (max 1)
+  t = t.replace(/\n[ \t]*\n[ \t]*(\n[ \t]*)+/g, "\n\n");
+  // trim fin de ligne + global
+  t = t.split("\n").map((s) => s.replace(/[ \t]+$/g, "")).join("\n");
   return t.trim();
 }
 
@@ -86,9 +92,35 @@ function fixOcrWordSplits(text) {
   return t;
 }
 
-// Correction visible (orthographe simple, doublons, capitalisation) + OCR fixes
+// Décolle les mots “glued” (FacebookInstagram → Facebook, Instagram ; communicateconnect → communicate connect)
+function deglueTokens(text) {
+  let t = String(text || "");
+
+  // 1) Suites CamelCase de noms propres: FacebookInstagramTikTok -> "Facebook, Instagram, TikTok"
+  t = t.replace(/([A-Z][a-z]+)(?=[A-Z][a-z]+)/g, "$1, ");
+
+  // 2) Espace avant and/or collés: "TikTokand" -> "TikTok and"
+  t = t.replace(/([A-Za-z])(and|or)\b/g, "$1 $2");
+
+  // 3) Espace avant tokens fréquents collés (communicateconnect -> communicate connect, etc.)
+  const TOKENS = [
+    "social", "media", "connect", "share", "more", "making", "seconds", "families", "professional",
+    "Similarly", "This", "Additionally", "Furthermore", "However", "Overall", "Users", "For", "These",
+    "Another", "Unlike", "Political", "Privacy", "Ultimately", "In", "As", "Research", "Today", "global", "community"
+  ];
+  t = t.replace(new RegExp(`([a-z])(?=(${TOKENS.join("|")})\\b)`, "g"), "$1 ");
+
+  // 4) Hyphénisation + cas courants
+  t = t.replace(/\bface ?to ?face\b/gi, "face-to-face");
+  t = t.replace(/\btwenty ?first\b/gi, "twenty-first");
+
+  return t;
+}
+
+// Correction visible (orthographe simple, doublons, capitalisation) + OCR fixes + deglue
 function aiSpellGrammarPass(input) {
   let t = String(input || "");
+  // fautes EN courantes
   t = t
     .replace(/\bteh\b/gi, "the")
     .replace(/\brecieve\b/gi, "receive")
@@ -96,10 +128,18 @@ function aiSpellGrammarPass(input) {
     .replace(/\bim\b/gi, "I'm")
     .replace(/\bdont\b/gi, "don't")
     .replace(/\bcant\b/gi, "can't");
-  t = t.replace(/\b(\w+)\s+\1\b/gi, "$1"); // doublons de mots
-  t = t.replace(/(^|[.!?]\s+)([a-zà-öø-ÿ])/g, (m, p1, p2) => p1 + p2.toUpperCase()); // majuscule
-  t = t.replace(/\bca va\b/gi, "ça va"); // FR
-  t = fixOcrWordSplits(t); // **clé pour V1**
+  // doublons de mots
+  t = t.replace(/\b(\w+)\s+\1\b/gi, "$1");
+  // capitalisation début de phrase (FR/EN)
+  t = t.replace(/(^|[.!?]\s+)([a-zà-öø-ÿ])/g, (m, p1, p2) => p1 + p2.toUpperCase());
+  // petit correctif FR
+  t = t.replace(/\bca va\b/gi, "ça va");
+
+  // 1) répare d’abord les splits OCR
+  t = fixOcrWordSplits(t);
+  // 2) puis “décolle” les tokens collés
+  t = deglueTokens(t);
+
   return t;
 }
 
@@ -174,6 +214,11 @@ function aiRephrase(input) {
         }
       }
       for (const [re, repl] of PHRASE_MAP) x = x.replace(re, repl);
+
+      // en début de phrase, ajoute la virgule après ces connecteurs
+      x = x.replace(/^(Overall|However|Furthermore|Additionally|Nevertheless)\b(?!,)/, "$1,");
+
+      // si aucune modif visible, injecter un connecteur doux (1 phrase sur 2)
       if (x === s && idx % 2 === 0) x = "Overall, " + x.charAt(0).toLowerCase() + x.slice(1);
       return x;
     })
@@ -411,14 +456,25 @@ function buildReportHtml({
 function tmpPath(name) {
   return path.join(os.tmpdir(), `${Date.now()}_${name}`);
 }
+
+// Zip en fichier temp (fiable), puis on renvoie le Buffer
 async function zipFiles(files) {
   return new Promise((resolve, reject) => {
-    const chunks = [];
+    const outPath = tmpPath("docsafe_result.zip");
+    const output = fs.createWriteStream(outPath);
     const archive = archiver("zip", { zlib: { level: 9 } });
-    archive.on("warning", (e) => console.warn("zip warn:", e));
-    archive.on("error", (e) => reject(e));
-    archive.on("data", (d) => chunks.push(d));
-    archive.on("end", () => resolve(Buffer.concat(chunks)));
+
+    output.on("close", () => {
+      try {
+        const buf = fs.readFileSync(outPath);
+        resolve(buf);
+      } catch (e) {
+        reject(e);
+      }
+    });
+    archive.on("error", reject);
+
+    archive.pipe(output);
     for (const f of files) archive.file(f.path, { name: f.name });
     archive.finalize();
   });
@@ -488,11 +544,13 @@ app.post("/clean-v2", upload.any(), async (req, res) => {
     const originalText = await extractTextFromFile(f.buffer, originalName, strictPdf);
     const lengthBefore = originalText.length;
 
-    const corrected = aiSpellGrammarPass(originalText); // clean pass d’abord
+    // Clean pass
+    const corrected = aiSpellGrammarPass(originalText);
     const cleanedText = normalizeText(corrected);
     const lengthCleaned = cleanedText.length;
 
-    const rephrasedText = aiRephrase(cleanedText); // réécriture marquée
+    // Rephrase pass
+    const rephrasedText = aiRephrase(cleanedText);
 
     const rephrasedPath = tmpPath("rephrased.docx");
     await createDocxFromText(rephrasedText, rephrasedPath);
