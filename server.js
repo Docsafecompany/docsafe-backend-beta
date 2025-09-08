@@ -9,7 +9,7 @@ import { fileURLToPath } from "url";
 import {
   processDocxBuffer,
   processPptxBuffer,
-  analyzeDocxBuffer, // ← pour /_docx_probe2
+  analyzeDocxBuffer, // pour /_docx_probe2
 } from "./lib/officeXml.js";
 import {
   stripPdfMetadata,
@@ -20,9 +20,15 @@ import { buildReportHtml } from "./lib/report.js";
 import { createDocxFromText } from "./lib/docxWriter.js";
 import { aiCorrectText, aiRephraseText } from "./lib/ai.js";
 
+// -----------------------------------------------------------------------------
+// ES module helpers
+// -----------------------------------------------------------------------------
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// -----------------------------------------------------------------------------
+// App & middleware
+// -----------------------------------------------------------------------------
 const app = express();
 app.use(cors({ origin: "*", credentials: false }));
 app.use(express.json({ limit: "32mb" }));
@@ -30,15 +36,19 @@ app.use(express.urlencoded({ extended: true, limit: "32mb" }));
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 50 * 1024 * 1024 },
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB
 });
 
-// ----------------- Helpers -----------------
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
 const getExt = (fn = "") =>
   fn.includes(".") ? fn.split(".").pop().toLowerCase() : "";
 const outName = (single, base, name) => (single ? name : `${base}_${name}`);
 
-// ----------------- Health / Echo -----------------
+// -----------------------------------------------------------------------------
+// Health / Echo
+// -----------------------------------------------------------------------------
 app.get("/health", (_, res) =>
   res.json({ ok: true, service: "DocSafe Backend", time: new Date().toISOString() })
 );
@@ -49,21 +59,29 @@ app.get("/_env_ok", (_, res) =>
 
 app.get("/_ai_echo", async (req, res) => {
   const sample =
-    req.query.q ||
-    "This is   a  test,, please  fix punctuation!! Thanks";
-  const out = (await aiCorrectText(String(sample))) || String(sample);
-  res.json({ input: sample, corrected: out });
+    req.query.q || "This is   a  test,, please  fix punctuation!! Thanks";
+  try {
+    const out = (await aiCorrectText(String(sample))) || String(sample);
+    res.json({ input: sample, corrected: out });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
 });
 
 app.get("/_ai_rephrase_echo", async (req, res) => {
   const sample =
-    req.query.q ||
-    "Overall, this is a sentence that could be rephrased furthermore.";
-  const out = (await aiRephraseText(String(sample))) || String(sample);
-  res.json({ input: sample, rephrased: out });
+    req.query.q || "Overall, this is a sentence that could be rephrased furthermore.";
+  try {
+    const out = (await aiRephraseText(String(sample))) || String(sample);
+    res.json({ input: sample, rephrased: out });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
 });
 
-// ----------------- V1: /clean -----------------
+// -----------------------------------------------------------------------------
+// V1: /clean  (correction stricte + report)
+// -----------------------------------------------------------------------------
 app.post("/clean", upload.any(), async (req, res) => {
   try {
     const strictPdf = String(req.body.strictPdf || "false") === "true";
@@ -166,7 +184,9 @@ app.post("/clean", upload.any(), async (req, res) => {
   }
 });
 
-// ----------------- V2: /clean-v2 -----------------
+// -----------------------------------------------------------------------------
+// V2: /clean-v2  (correction + reformulation + report)
+// -----------------------------------------------------------------------------
 app.post("/clean-v2", upload.any(), async (req, res) => {
   try {
     const strictPdf = String(req.body.strictPdf || "false") === "true";
@@ -284,7 +304,9 @@ app.post("/clean-v2", upload.any(), async (req, res) => {
   }
 });
 
-// ----------------- DEBUG routes -----------------
+// -----------------------------------------------------------------------------
+// DEBUG routes
+// -----------------------------------------------------------------------------
 
 // 1) Probe binaire: vérifie qu'un DOCX change "physiquement"
 app.post("/_docx_probe", upload.single("file"), async (req, res) => {
@@ -306,12 +328,14 @@ app.post("/_docx_probe", upload.single("file"), async (req, res) => {
   }
 });
 
-// 2) Probe analytique: combien de paragraphes ont réellement changé
+// 2) Probe analytique: combien de paragraphes ont réellement changé (V1 ou V2)
 app.post("/_docx_probe2", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No DOCX uploaded" });
-    const stats = await analyzeDocxBuffer(req.file.buffer, "V1");
+    const mode = (String(req.query.mode || "V1").toUpperCase() === "V2") ? "V2" : "V1";
+    const stats = await analyzeDocxBuffer(req.file.buffer, mode);
     res.json({
+      mode,
       filename: req.file.originalname,
       paragraphs_total: stats.totalParagraphs,
       paragraphs_changed: stats.changedParagraphs,
@@ -323,7 +347,7 @@ app.post("/_docx_probe2", upload.single("file"), async (req, res) => {
   }
 });
 
-// (optionnel) Petits tests PDF/Office de bout en bout
+// 3) (optionnel) Test PDF: extraction + nettoyage (strictPdf=true)
 app.post("/_pdf_test", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No PDF uploaded" });
@@ -343,6 +367,7 @@ app.post("/_pdf_test", upload.single("file"), async (req, res) => {
   }
 });
 
+// 4) (optionnel) Test Office: renvoie un fichier modifié (DOCX/PPTX) directement
 app.post("/_office_test", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
@@ -360,9 +385,9 @@ app.post("/_office_test", upload.single("file"), async (req, res) => {
   }
 });
 
-// ----------------- Listen -----------------
-const PORT = process.env.PORT || 10000;
-// ===== FORMS (test depuis le navigateur) =====
+// -----------------------------------------------------------------------------
+// Petit panneau de test navigateur (+ GET clairs pour les routes POST)
+// -----------------------------------------------------------------------------
 app.get("/_test", (_, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.end(`<!doctype html>
@@ -373,11 +398,15 @@ app.get("/_test", (_, res) => {
 
   <fieldset>
     <legend>/_docx_probe2 (POST)</legend>
-    <form action="/_docx_probe2" method="post" enctype="multipart/form-data" target="_blank">
+    <form action="/_docx_probe2?mode=V1" method="post" enctype="multipart/form-data" target="_blank">
       <input type="file" name="file" accept=".docx" required>
-      <button type="submit">Tester _docx_probe2</button>
+      <button type="submit">Tester V1</button>
     </form>
-    <p>Renvoie nombre de paragraphes modifiés.</p>
+    <form action="/_docx_probe2?mode=V2" method="post" enctype="multipart/form-data" target="_blank" style="margin-top:8px;">
+      <input type="file" name="file" accept=".docx" required>
+      <button type="submit">Tester V2</button>
+    </form>
+    <p>Renvoie le nombre de paragraphes modifiés.</p>
   </fieldset>
 
   <fieldset>
@@ -406,10 +435,20 @@ app.get("/_test", (_, res) => {
 </body></html>`);
 });
 
-// (optionnel) messages clairs si on tente GET sur des routes POST
-app.get("/clean", (_, res) => res.status(405).send('Use POST multipart/form-data. Astuce: ouvrez /_test'));
-app.get("/clean-v2", (_, res) => res.status(405).send('Use POST multipart/form-data. Astuce: ouvrez /_test'));
-app.get("/_docx_probe2", (_, res) => res.status(405).send('Use POST multipart/form-data. Astuce: ouvrez /_test'));
+app.get("/clean", (_, res) =>
+  res.status(405).send('Use POST multipart/form-data. Astuce: ouvrez /_test')
+);
+app.get("/clean-v2", (_, res) =>
+  res.status(405).send('Use POST multipart/form-data. Astuce: ouvrez /_test')
+);
+app.get("/_docx_probe2", (_, res) =>
+  res.status(405).send('Use POST multipart/form-data. Astuce: ouvrez /_test')
+);
 
+// -----------------------------------------------------------------------------
+// Listen
+// -----------------------------------------------------------------------------
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`DocSafe backend listening on ${PORT}`));
+
 
