@@ -20,6 +20,11 @@ import { buildReportHtml } from "./lib/report.js";
 import { createDocxFromText } from "./lib/docxWriter.js";
 import { aiCorrectText, aiRephraseText } from "./lib/ai.js";
 
+// ✅ NEW: cleaners
+import { cleanDOCX } from "./lib/docxcleaner.js";
+import { cleanPPTX } from "./lib/pptxcleaner.js";
+import { cleanPDF  } from "./lib/pdfcleaner.js";
+
 // -----------------------------------------------------------------------------
 // ES module helpers
 // -----------------------------------------------------------------------------
@@ -45,6 +50,24 @@ const upload = multer({
 const getExt = (fn = "") =>
   fn.includes(".") ? fn.split(".").pop().toLowerCase() : "";
 const outName = (single, base, name) => (single ? name : `${base}_${name}`);
+
+// ✅ NEW: sanitation commun
+const sanitizeBuffer = async (originalName, buf, opts = {}) => {
+  const ext = getExt(originalName);
+  if (ext === "docx") {
+    const { outBuffer } = await cleanDOCX(buf);
+    return outBuffer;
+  }
+  if (ext === "pptx") {
+    const { outBuffer } = await cleanPPTX(buf);
+    return outBuffer;
+  }
+  if (ext === "pdf") {
+    const { outBuffer } = await cleanPDF(buf, { strict: Boolean(opts.strictPdf) });
+    return outBuffer;
+  }
+  return buf; // autres formats inchangés
+};
 
 // -----------------------------------------------------------------------------
 // Health / Echo
@@ -96,7 +119,10 @@ app.post("/clean", upload.any(), async (req, res) => {
       const base = path.parse(f.originalname).name;
 
       if (ext === "docx") {
-        const cleanedBuf = await processDocxBuffer(f.buffer, "V1");
+        // ✅ sanitize
+        const sanitized = await sanitizeBuffer(f.originalname, f.buffer, { strictPdf });
+        const cleanedBuf = await processDocxBuffer(sanitized, "V1");
+
         zip.addFile(outName(single, base, "cleaned.docx"), cleanedBuf);
         zip.addFile(
           outName(single, base, "report.html"),
@@ -112,7 +138,10 @@ app.post("/clean", upload.any(), async (req, res) => {
           )
         );
       } else if (ext === "pptx") {
-        const cleanedBuf = await processPptxBuffer(f.buffer, "V1");
+        // ✅ sanitize
+        const sanitized = await sanitizeBuffer(f.originalname, f.buffer, { strictPdf });
+        const cleanedBuf = await processPptxBuffer(sanitized, "V1");
+
         zip.addFile(outName(single, base, "cleaned.pptx"), cleanedBuf);
         zip.addFile(
           outName(single, base, "report.html"),
@@ -128,13 +157,15 @@ app.post("/clean", upload.any(), async (req, res) => {
           )
         );
       } else if (ext === "pdf") {
-        const pdfSan = await stripPdfMetadata(f.buffer);
-        const rawText = await extractPdfText(pdfSan);
+        // ✅ sanitize PDF (annots + embedded files)
+        const sanitizedPdf = await sanitizeBuffer(f.originalname, f.buffer, { strictPdf });
+        const rawText = await extractPdfText(sanitizedPdf);
         const filtered = filterExtractedLines(rawText, { strictPdf });
+
         const cleanedTxt = (await aiCorrectText(filtered)) || filtered;
         const cleanedDocx = await createDocxFromText(cleanedTxt, base || "cleaned");
 
-        zip.addFile(outName(single, base, "pdf_sanitized.pdf"), pdfSan);
+        zip.addFile(outName(single, base, "pdf_sanitized.pdf"), sanitizedPdf);
         zip.addFile(outName(single, base, "cleaned.docx"), cleanedDocx);
         zip.addFile(
           outName(single, base, "report.html"),
@@ -201,8 +232,10 @@ app.post("/clean-v2", upload.any(), async (req, res) => {
       const base = path.parse(f.originalname).name;
 
       if (ext === "docx") {
-        const cleanedBuf = await processDocxBuffer(f.buffer, "V1");
-        const rephrasedBuf = await processDocxBuffer(f.buffer, "V2");
+        // ✅ sanitize
+        const sanitized = await sanitizeBuffer(f.originalname, f.buffer, { strictPdf });
+        const cleanedBuf   = await processDocxBuffer(sanitized, "V1");
+        const rephrasedBuf = await processDocxBuffer(sanitized, "V2");
 
         zip.addFile(outName(single, base, "cleaned.docx"), cleanedBuf);
         zip.addFile(outName(single, base, "rephrased.docx"), rephrasedBuf);
@@ -220,8 +253,10 @@ app.post("/clean-v2", upload.any(), async (req, res) => {
           )
         );
       } else if (ext === "pptx") {
-        const cleanedBuf = await processPptxBuffer(f.buffer, "V1");
-        const rephrasedBuf = await processPptxBuffer(f.buffer, "V2");
+        // ✅ sanitize
+        const sanitized = await sanitizeBuffer(f.originalname, f.buffer, { strictPdf });
+        const cleanedBuf   = await processPptxBuffer(sanitized, "V1");
+        const rephrasedBuf = await processPptxBuffer(sanitized, "V2");
 
         zip.addFile(outName(single, base, "cleaned.pptx"), cleanedBuf);
         zip.addFile(outName(single, base, "rephrased.pptx"), rephrasedBuf);
@@ -239,18 +274,19 @@ app.post("/clean-v2", upload.any(), async (req, res) => {
           )
         );
       } else if (ext === "pdf") {
-        const pdfSan = await stripPdfMetadata(f.buffer);
-        const rawText = await extractPdfText(pdfSan);
+        // ✅ sanitize PDF (annots + embedded files)
+        const sanitizedPdf = await sanitizeBuffer(f.originalname, f.buffer, { strictPdf });
+        const rawText = await extractPdfText(sanitizedPdf);
         const filtered = filterExtractedLines(rawText, { strictPdf });
 
-        const cleanedTxt = (await aiCorrectText(filtered)) || filtered;
+        const cleanedTxt   = (await aiCorrectText(filtered))   || filtered;
         const rephrasedTxt = (await aiRephraseText(cleanedTxt)) || cleanedTxt;
 
-        const cleanedDocx = await createDocxFromText(cleanedTxt, base || "cleaned");
+        const cleanedDocx   = await createDocxFromText(cleanedTxt,   base || "cleaned");
         const rephrasedDocx = await createDocxFromText(rephrasedTxt, base || "rephrased");
 
-        zip.addFile(outName(single, base, "pdf_sanitized.pdf"), pdfSan);
-        zip.addFile(outName(single, base, "cleaned.docx"), cleanedDocx);
+        zip.addFile(outName(single, base, "pdf_sanitized.pdf"), sanitizedPdf);
+        zip.addFile(outName(single, base, "cleaned.docx"),   cleanedDocx);
         zip.addFile(outName(single, base, "rephrased.docx"), rephrasedDocx);
         zip.addFile(
           outName(single, base, "report.html"),
@@ -267,14 +303,14 @@ app.post("/clean-v2", upload.any(), async (req, res) => {
         );
       } else {
         // Fallback texte brut
-        const original = f.buffer.toString("utf8");
-        const cleanedTxt = (await aiCorrectText(original)) || original;
+        const original     = f.buffer.toString("utf8");
+        const cleanedTxt   = (await aiCorrectText(original))   || original;
         const rephrasedTxt = (await aiRephraseText(cleanedTxt)) || cleanedTxt;
 
-        const cleanedDocx = await createDocxFromText(cleanedTxt, base || "cleaned");
+        const cleanedDocx   = await createDocxFromText(cleanedTxt,   base || "cleaned");
         const rephrasedDocx = await createDocxFromText(rephrasedTxt, base || "rephrased");
 
-        zip.addFile(outName(single, base, "cleaned.docx"), cleanedDocx);
+        zip.addFile(outName(single, base, "cleaned.docx"),   cleanedDocx);
         zip.addFile(outName(single, base, "rephrased.docx"), rephrasedDocx);
         zip.addFile(
           outName(single, base, "report.html"),
@@ -305,16 +341,14 @@ app.post("/clean-v2", upload.any(), async (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// DEBUG routes
+// DEBUG routes (inchangées)
 // -----------------------------------------------------------------------------
-
-// 1) Probe binaire: vérifie qu'un DOCX change "physiquement"
 app.post("/_docx_probe", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No DOCX uploaded" });
     const buf = req.file.buffer;
     const before = buf.length;
-    const out = await processDocxBuffer(buf, "V1"); // écrit réellement
+    const out = await processDocxBuffer(buf, "V1");
     const after = out.length;
     res.json({
       filename: req.file.originalname,
@@ -328,7 +362,6 @@ app.post("/_docx_probe", upload.single("file"), async (req, res) => {
   }
 });
 
-// 2) Probe analytique: combien de paragraphes ont réellement changé (V1 ou V2)
 app.post("/_docx_probe2", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No DOCX uploaded" });
@@ -339,7 +372,7 @@ app.post("/_docx_probe2", upload.single("file"), async (req, res) => {
       filename: req.file.originalname,
       paragraphs_total: stats.totalParagraphs,
       paragraphs_changed: stats.changedParagraphs,
-      parts: stats.perPart, // [{kind:'docx', total, changed}, ...]
+      parts: stats.perPart,
     });
   } catch (e) {
     console.error("DEBUG _docx_probe2 error:", e);
@@ -347,7 +380,6 @@ app.post("/_docx_probe2", upload.single("file"), async (req, res) => {
   }
 });
 
-// 3) (optionnel) Test PDF: extraction + nettoyage (strictPdf=true)
 app.post("/_pdf_test", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No PDF uploaded" });
@@ -367,7 +399,6 @@ app.post("/_pdf_test", upload.single("file"), async (req, res) => {
   }
 });
 
-// 4) (optionnel) Test Office: renvoie un fichier modifié (DOCX/PPTX) directement
 app.post("/_office_test", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
@@ -384,66 +415,6 @@ app.post("/_office_test", upload.single("file"), async (req, res) => {
     res.status(500).json({ error: String(e?.message || e) });
   }
 });
-
-// -----------------------------------------------------------------------------
-// Petit panneau de test navigateur (+ GET clairs pour les routes POST)
-// -----------------------------------------------------------------------------
-app.get("/_test", (_, res) => {
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.end(`<!doctype html>
-<html><head><meta charset="utf-8"><title>DocSafe Test</title>
-<style>body{font-family:system-ui;margin:24px;line-height:1.4} fieldset{margin:16px 0;padding:12px}</style>
-</head><body>
-  <h1>DocSafe — Formulaires de test</h1>
-
-  <fieldset>
-    <legend>/_docx_probe2 (POST)</legend>
-    <form action="/_docx_probe2?mode=V1" method="post" enctype="multipart/form-data" target="_blank">
-      <input type="file" name="file" accept=".docx" required>
-      <button type="submit">Tester V1</button>
-    </form>
-    <form action="/_docx_probe2?mode=V2" method="post" enctype="multipart/form-data" target="_blank" style="margin-top:8px;">
-      <input type="file" name="file" accept=".docx" required>
-      <button type="submit">Tester V2</button>
-    </form>
-    <p>Renvoie le nombre de paragraphes modifiés.</p>
-  </fieldset>
-
-  <fieldset>
-    <legend>/clean (POST) — V1</legend>
-    <form action="/clean" method="post" enctype="multipart/form-data">
-      <input type="file" name="file" accept=".docx,.pptx,.pdf" required>
-      <label style="margin-left:8px;">
-        <input type="checkbox" name="strictPdf" value="true"> strictPdf
-      </label>
-      <button type="submit">Lancer V1</button>
-    </form>
-    <p>Télécharge un ZIP (cleaned.* + report.html).</p>
-  </fieldset>
-
-  <fieldset>
-    <legend>/clean-v2 (POST) — V2</legend>
-    <form action="/clean-v2" method="post" enctype="multipart/form-data">
-      <input type="file" name="file" accept=".docx,.pptx,.pdf" required>
-      <label style="margin-left:8px;">
-        <input type="checkbox" name="strictPdf" value="true"> strictPdf
-      </label>
-      <button type="submit">Lancer V2</button>
-    </form>
-    <p>Télécharge un ZIP (cleaned.* + rephrased.* + report.html).</p>
-  </fieldset>
-</body></html>`);
-});
-
-app.get("/clean", (_, res) =>
-  res.status(405).send('Use POST multipart/form-data. Astuce: ouvrez /_test')
-);
-app.get("/clean-v2", (_, res) =>
-  res.status(405).send('Use POST multipart/form-data. Astuce: ouvrez /_test')
-);
-app.get("/_docx_probe2", (_, res) =>
-  res.status(405).send('Use POST multipart/form-data. Astuce: ouvrez /_test')
-);
 
 // -----------------------------------------------------------------------------
 // Listen
