@@ -21,9 +21,9 @@ import { createDocxFromText } from "./lib/docxWriter.js";
 import { aiCorrectText, aiRephraseText } from "./lib/ai.js";
 
 // ✅ NEW: cleaners
-import { cleanDOCX } from "./lib/docxcleaner.js";
-import { cleanPPTX } from "./lib/pptxcleaner.js";
-import { cleanPDF  } from "./lib/pdfcleaner.js";
+import { cleanDOCX } from "./lib/docxCleaner.js";
+import { cleanPPTX } from "./lib/pptxCleaner.js";
+import { cleanPDF  } from "./lib/pdfCleaner.js";
 
 // -----------------------------------------------------------------------------
 // ES module helpers
