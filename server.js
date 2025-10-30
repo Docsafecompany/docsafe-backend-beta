@@ -21,7 +21,11 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-app.use(cors({ origin: "*", credentials: false }));
+app.use(cors({
+  origin: ["https://mindorion.com", "https://www.mindorion.com", "http://localhost:5173"],
+  methods: ["GET", "POST"],
+  allowedHeaders: ["Content-Type"],
+}));
 app.use(express.json({ limit: "32mb" }));
 app.use(express.urlencoded({ extended: true, limit: "32mb" }));
 
