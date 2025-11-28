@@ -1,45 +1,63 @@
-// server.js
+// server.js - VERSION FINALE AVEC /analyze
 import express from "express";
 import cors from "cors";
 import multer from "multer";
 import AdmZip from "adm-zip";
 import path from "path";
 import { fileURLToPath } from "url";
+import { v4 as uuidv4 } from "uuid";
 
+// Tes imports existants
 import { cleanDOCX } from "./lib/docxCleaner.js";
 import { cleanPPTX } from "./lib/pptxCleaner.js";
 import { cleanPDF } from "./lib/pdfCleaner.js";
 import { correctDOCXText, correctPPTXText } from "./lib/officeCorrect.js";
 import { buildReportHtmlDetailed } from "./lib/report.js";
-
-// (facultatif, pour PDF -> DOCX corrigé côté /clean)
 import { extractPdfText, filterExtractedLines } from "./lib/pdfTools.js";
 import { createDocxFromText } from "./lib/docxWriter.js";
-import { aiCorrectText } from "./lib/ai.js"; // correction ciblée sans reformuler la mise en page
+import { aiCorrectText } from "./lib/ai.js";
+
+// NOUVEAU: Import de documentAnalyzer
+import { analyzeDocument, calculateSummary } from "./lib/documentAnalyzer.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 app.use(cors({
-  origin: ["https://mindorion.com", "https://www.mindorion.com", "http://localhost:5173"],
+  origin: [
+    "https://mindorion.com", 
+    "https://www.mindorion.com", 
+    "http://localhost:5173",
+    "http://localhost:8080",
+    /\.lovableproject\.com$/,  // Lovable preview domains
+    /\.lovable\.app$/          // Lovable production domains
+  ],
   methods: ["GET", "POST"],
-  allowedHeaders: ["Content-Type"],
+  allowedHeaders: ["Content-Type", "Authorization"],
 }));
-app.use(express.json({ limit: "32mb" }));
-app.use(express.urlencoded({ extended: true, limit: "32mb" }));
+app.use(express.json({ limit: "100mb" }));
+app.use(express.urlencoded({ extended: true, limit: "100mb" }));
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 50 * 1024 * 1024 },
+  limits: { fileSize: 100 * 1024 * 1024 }, // 100MB
 });
 
 // ---------- Helpers ----------
 const getExt = (fn = "") => (fn.includes(".") ? fn.split(".").pop().toLowerCase() : "");
+const getMimeFromExt = (ext) => {
+  const map = {
+    docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    pdf: 'application/pdf'
+  };
+  return map[ext] || 'application/octet-stream';
+};
 const outName = (single, base, name) => (single ? name : `${base}_${name}`);
 const baseName = (filename = "document") => filename.replace(/\.[^.]+$/, "");
 
-// Pour envoyer le zip avec un nom parlant
 function sendZip(res, zip, zipName) {
   res.setHeader("Content-Type", "application/zip");
   res.setHeader("Content-Disposition", `attachment; filename="${zipName}"`);
@@ -48,21 +66,172 @@ function sendZip(res, zip, zipName) {
 
 // ---------- Health ----------
 app.get("/health", (_, res) =>
-  res.json({ ok: true, service: "DocSafe Backend", time: new Date().toISOString() })
+  res.json({ 
+    ok: true, 
+    service: "Qualion-Doc Backend", 
+    version: "2.0",
+    endpoints: ["/analyze", "/clean", "/rephrase"],
+    time: new Date().toISOString() 
+  })
 );
 
 // ===================================================================
-// POST /clean  → nettoyage + (optionnel) correction légère + report
+// POST /analyze  → NOUVEAU: Analyse pour preview interactif
+// ===================================================================
+app.post("/analyze", upload.single("file"), async (req, res) => {
+  const startTime = Date.now();
+  
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded." });
+    }
+    
+    const ext = getExt(req.file.originalname);
+    const supportedExts = ['docx', 'pptx', 'xlsx', 'pdf'];
+    
+    if (!supportedExts.includes(ext)) {
+      return res.status(400).json({ 
+        error: `Unsupported file type: .${ext}. Supported: ${supportedExts.join(', ')}` 
+      });
+    }
+    
+    console.log(`[ANALYZE] Processing ${req.file.originalname} (${(req.file.size / 1024).toFixed(1)} KB)`);
+    
+    // Utilise ton documentAnalyzer.js existant
+    const fileType = getMimeFromExt(ext);
+    const detections = await analyzeDocument(req.file.buffer, fileType);
+    const summary = calculateSummary(detections);
+    
+    // Calcul du risk score
+    const riskScore = calculateRiskScore(summary);
+    
+    const result = {
+      // Identifiant unique pour cette analyse
+      documentId: uuidv4(),
+      
+      // Info fichier
+      fileName: req.file.originalname,
+      fileType: ext,
+      fileSize: req.file.size,
+      
+      // Détections (format compatible avec ton frontend Lovable)
+      detections: {
+        metadata: detections.metadata || [],
+        comments: detections.comments || [],
+        trackChanges: detections.trackChanges || [],
+        hiddenContent: detections.hiddenContent || [],
+        hiddenSheets: detections.hiddenSheets || [],
+        sensitiveFormulas: detections.sensitiveFormulas || [],
+        embeddedObjects: detections.embeddedObjects || [],
+        macros: detections.macros || [],
+        sensitiveData: detections.sensitiveData || [],
+        spellingErrors: detections.spellingErrors || [],
+        brokenLinks: detections.brokenLinks || [],
+        businessInconsistencies: detections.businessInconsistencies || [],
+        complianceRisks: detections.complianceRisks || []
+      },
+      
+      // Résumé
+      summary: {
+        totalIssues: summary.totalIssues,
+        critical: summary.critical,
+        high: summary.high,
+        medium: summary.medium,
+        low: summary.low,
+        riskScore: riskScore,
+        recommendations: generateRecommendations(detections, summary)
+      },
+      
+      // Performance
+      processingTime: Date.now() - startTime
+    };
+    
+    console.log(`[ANALYZE] Complete in ${result.processingTime}ms - ${summary.totalIssues} issues found, risk score: ${riskScore}`);
+    
+    res.json(result);
+    
+  } catch (e) {
+    console.error("[ANALYZE ERROR]", e);
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
+// Helper: Calcul du score de risque (0-100, 100 = safe)
+function calculateRiskScore(summary) {
+  let score = 100;
+  
+  // Déductions basées sur la sévérité
+  score -= summary.critical * 25;
+  score -= summary.high * 10;
+  score -= summary.medium * 5;
+  score -= summary.low * 2;
+  
+  // Minimum 0, maximum 100
+  return Math.max(0, Math.min(100, score));
+}
+
+// Helper: Génération des recommandations
+function generateRecommendations(detections, summary) {
+  const recommendations = [];
+  
+  if (detections.metadata?.length > 0) {
+    recommendations.push("Remove document metadata to protect author and organization information.");
+  }
+  
+  if (detections.comments?.length > 0) {
+    recommendations.push(`Review and remove ${detections.comments.length} comment(s) before sharing externally.`);
+  }
+  
+  if (detections.trackChanges?.length > 0) {
+    recommendations.push("Accept or reject all tracked changes to finalize the document.");
+  }
+  
+  if (detections.hiddenContent?.length > 0 || detections.hiddenSheets?.length > 0) {
+    recommendations.push("Remove hidden content that could expose confidential information.");
+  }
+  
+  if (detections.macros?.length > 0) {
+    recommendations.push("Remove macros for security - they can contain executable code.");
+  }
+  
+  if (detections.sensitiveData?.length > 0) {
+    const types = [...new Set(detections.sensitiveData.map(d => d.type))];
+    recommendations.push(`Review sensitive data detected: ${types.join(', ')}.`);
+  }
+  
+  if (detections.embeddedObjects?.length > 0) {
+    recommendations.push("Remove embedded objects that may contain hidden data.");
+  }
+  
+  if (recommendations.length === 0) {
+    recommendations.push("Document appears clean. Minor review recommended before external sharing.");
+  }
+  
+  return recommendations;
+}
+
+// ===================================================================
+// POST /clean  → EXISTANT (ton code actuel, gardé tel quel)
 // ===================================================================
 app.post("/clean", upload.any(), async (req, res) => {
   try {
     const files = req.files || [];
     if (!files.length) return res.status(400).json({ error: "No files uploaded." });
 
-    // options depuis le frontend
-    const drawPolicy = (req.body.drawPolicy || "auto").toLowerCase(); // auto|all|none
-    const pdfMode = (req.body.pdfMode || "sanitize").toLowerCase(); // sanitize|text-only
+    const drawPolicy = (req.body.drawPolicy || "auto").toLowerCase();
+    const pdfMode = (req.body.pdfMode || "sanitize").toLowerCase();
     const includePdfDocx = String(req.body.pdfDocx || "false") === "true";
+    
+    // NOUVELLES OPTIONS pour nettoyage granulaire
+    const cleaningOptions = {
+      removeMetadata: req.body.removeMetadata !== "false",
+      removeComments: req.body.removeComments !== "false",
+      acceptTrackChanges: req.body.acceptTrackChanges !== "false",
+      removeHiddenContent: req.body.removeHiddenContent !== "false",
+      removeEmbeddedObjects: req.body.removeEmbeddedObjects !== "false",
+      removeMacros: req.body.removeMacros !== "false",
+      correctSpelling: req.body.correctSpelling !== "false",
+    };
 
     const single = files.length === 1;
     const zip = new AdmZip();
@@ -71,36 +240,55 @@ app.post("/clean", upload.any(), async (req, res) => {
       const ext = getExt(f.originalname);
       const base = path.parse(f.originalname).name;
 
+      console.log(`[CLEAN] Processing ${f.originalname} with options:`, cleaningOptions);
+
       if (ext === "docx") {
-        // 1) Clean
-        const cleaned = await cleanDOCX(f.buffer, { drawPolicy });
-        // 2) Correction ciblée des nœuds texte <w:t> (préserve la mise en page)
-        const corrected = await correctDOCXText(cleaned.outBuffer, aiCorrectText);
+        const cleaned = await cleanDOCX(f.buffer, { drawPolicy, ...cleaningOptions });
+        
+        // Correction IA seulement si demandée
+        let finalBuffer = cleaned.outBuffer;
+        let correctionStats = null;
+        
+        if (cleaningOptions.correctSpelling) {
+          const corrected = await correctDOCXText(cleaned.outBuffer, aiCorrectText);
+          finalBuffer = corrected.outBuffer;
+          correctionStats = corrected.stats;
+        }
 
-        zip.addFile(outName(single, base, "cleaned.docx"), corrected.outBuffer);
+        zip.addFile(outName(single, base, "cleaned.docx"), finalBuffer);
 
         const report = buildReportHtmlDetailed({
           filename: f.originalname,
           ext,
-          policy: { drawPolicy },
+          policy: { drawPolicy, ...cleaningOptions },
           cleaning: cleaned.stats,
-          correction: corrected.stats,
+          correction: correctionStats,
         });
         zip.addFile(outName(single, base, "report.html"), Buffer.from(report, "utf8"));
+        
       } else if (ext === "pptx") {
-        const cleaned = await cleanPPTX(f.buffer, { drawPolicy });
-        const corrected = await correctPPTXText(cleaned.outBuffer, aiCorrectText);
+        const cleaned = await cleanPPTX(f.buffer, { drawPolicy, ...cleaningOptions });
+        
+        let finalBuffer = cleaned.outBuffer;
+        let correctionStats = null;
+        
+        if (cleaningOptions.correctSpelling) {
+          const corrected = await correctPPTXText(cleaned.outBuffer, aiCorrectText);
+          finalBuffer = corrected.outBuffer;
+          correctionStats = corrected.stats;
+        }
 
-        zip.addFile(outName(single, base, "cleaned.pptx"), corrected.outBuffer);
+        zip.addFile(outName(single, base, "cleaned.pptx"), finalBuffer);
 
         const report = buildReportHtmlDetailed({
           filename: f.originalname,
           ext,
-          policy: { drawPolicy },
+          policy: { drawPolicy, ...cleaningOptions },
           cleaning: cleaned.stats,
-          correction: corrected.stats,
+          correction: correctionStats,
         });
         zip.addFile(outName(single, base, "report.html"), Buffer.from(report, "utf8"));
+        
       } else if (ext === "pdf") {
         const cleaned = await cleanPDF(f.buffer, {
           pdfMode: pdfMode === "text-only" ? "text-only" : "sanitize",
@@ -112,7 +300,6 @@ app.post("/clean", upload.any(), async (req, res) => {
           cleaned.outBuffer
         );
 
-        // Option : produire un DOCX texte pour édition
         let correctionStats = null;
         if (includePdfDocx) {
           const raw = await extractPdfText(cleaned.outBuffer);
@@ -123,25 +310,23 @@ app.post("/clean", upload.any(), async (req, res) => {
 
           correctionStats = {
             totalTextNodes: 0,
-            changedTextNodes:
-              correctedTxt && filtered ? (correctedTxt.trim() === filtered.trim() ? 0 : 1) : 0,
-            examples:
-              correctedTxt && filtered && correctedTxt.trim() !== filtered.trim()
-                ? [{ before: filtered.slice(0, 140), after: correctedTxt.slice(0, 140) }]
-                : [],
+            changedTextNodes: correctedTxt && filtered ? (correctedTxt.trim() === filtered.trim() ? 0 : 1) : 0,
+            examples: correctedTxt && filtered && correctedTxt.trim() !== filtered.trim()
+              ? [{ before: filtered.slice(0, 140), after: correctedTxt.slice(0, 140) }]
+              : [],
           };
         }
 
         const report = buildReportHtmlDetailed({
           filename: f.originalname,
           ext,
-          policy: { pdfMode },
+          policy: { pdfMode, ...cleaningOptions },
           cleaning: cleaned.stats,
           correction: correctionStats,
         });
         zip.addFile(outName(single, base, "report.html"), Buffer.from(report, "utf8"));
+        
       } else {
-        // autres formats → on remet tel quel + report basique
         zip.addFile(outName(single, base, f.originalname), f.buffer);
         const report = buildReportHtmlDetailed({
           filename: f.originalname,
@@ -154,10 +339,9 @@ app.post("/clean", upload.any(), async (req, res) => {
       }
     }
 
-    // Nom du ZIP
     const zipName = files.length === 1
       ? `${baseName(files[0].originalname)} cleaned.zip`
-      : "docsafe_cleaned.zip";
+      : "qualion_doc_cleaned.zip";
 
     sendZip(res, zip, zipName);
   } catch (e) {
@@ -167,14 +351,14 @@ app.post("/clean", upload.any(), async (req, res) => {
 });
 
 // ===================================================================
-// POST /rephrase  → réécriture du texte + report (DOCX/PPTX)
+// POST /rephrase  → EXISTANT (gardé tel quel)
 // ===================================================================
 app.post("/rephrase", upload.any(), async (req, res) => {
   try {
     const files = req.files || [];
     if (!files.length) return res.status(400).json({ error: "No files uploaded." });
 
-    const drawPolicy = (req.body.drawPolicy || "auto").toLowerCase(); // cohérence avec /clean
+    const drawPolicy = (req.body.drawPolicy || "auto").toLowerCase();
     const single = files.length === 1;
     const zip = new AdmZip();
 
@@ -183,7 +367,6 @@ app.post("/rephrase", upload.any(), async (req, res) => {
       const base = path.parse(f.originalname).name;
 
       if (ext === "docx") {
-        // on passe par un léger nettoyage pour fiabiliser la structure, puis rephrase
         const cleaned = await cleanDOCX(f.buffer, { drawPolicy });
         const rephrased = await correctDOCXText(cleaned.outBuffer, aiCorrectText, {
           mode: "rephrase",
@@ -199,6 +382,7 @@ app.post("/rephrase", upload.any(), async (req, res) => {
           correction: rephrased.stats,
         });
         zip.addFile(outName(single, base, "report.html"), Buffer.from(report, "utf8"));
+        
       } else if (ext === "pptx") {
         const cleaned = await cleanPPTX(f.buffer, { drawPolicy });
         const rephrased = await correctPPTXText(cleaned.outBuffer, aiCorrectText, {
@@ -215,11 +399,9 @@ app.post("/rephrase", upload.any(), async (req, res) => {
           correction: rephrased.stats,
         });
         zip.addFile(outName(single, base, "report.html"), Buffer.from(report, "utf8"));
+        
       } else if (ext === "pdf") {
-        // par sécurité, on évite la réécriture directe des PDF
-        return res
-          .status(400)
-          .json({ error: "Rephrase for PDF is disabled. Convert to DOCX/PPTX first." });
+        return res.status(400).json({ error: "Rephrase for PDF is disabled. Convert to DOCX/PPTX first." });
       } else {
         return res.status(400).json({ error: `Unsupported file for rephrase: .${ext}` });
       }
@@ -227,7 +409,7 @@ app.post("/rephrase", upload.any(), async (req, res) => {
 
     const zipName = files.length === 1
       ? `${baseName(files[0].originalname)} rephrased.zip`
-      : "docsafe_rephrased.zip";
+      : "qualion_doc_rephrased.zip";
 
     sendZip(res, zip, zipName);
   } catch (e) {
@@ -238,4 +420,8 @@ app.post("/rephrase", upload.any(), async (req, res) => {
 
 // ---------- Boot ----------
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`DocSafe backend listening on ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`✅ Qualion-Doc Backend v2.0 listening on port ${PORT}`);
+  console.log(`   Endpoints: GET /health, POST /analyze, POST /clean, POST /rephrase`);
+});
+
