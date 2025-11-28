@@ -1,7 +1,7 @@
 {
   "name": "docsafe-backend-beta",
-  "version": "1.0.0",
-  "description": "DocSafe backend (Render, Express, ZIP, PDF/DOCX/PPTX, structure-preserving edits)",
+  "version": "2.0.0",
+  "description": "Qualion-Doc backend (Render, Express, ZIP, PDF/DOCX/PPTX/XLSX, structure-preserving edits)",
   "type": "module",
   "engines": { "node": ">=20 <23" },
   "scripts": {
@@ -15,6 +15,9 @@
     "express": "^4.19.2",
     "jszip": "^3.10.1",
     "multer": "^1.4.5-lts.1",
-    "pdf-lib": "^1.17.1"
+    "pdf-lib": "^1.17.1",
+    "xml2js": "^0.6.2",
+    "exceljs": "^4.4.0",
+    "uuid": "^9.0.1"
   }
 }
