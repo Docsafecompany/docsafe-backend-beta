@@ -1,4 +1,4 @@
-// server.js - VERSION FINALE AVEC /analyze
+// server.js - VERSION FINALE AVEC /analyze ET SPELLING ERRORS DANS REPORTS
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -30,8 +30,8 @@ app.use(cors({
     "https://www.mindorion.com", 
     "http://localhost:5173",
     "http://localhost:8080",
-    /\.lovableproject\.com$/,  // Lovable preview domains
-    /\.lovable\.app$/          // Lovable production domains
+    /\.lovableproject\.com$/,
+    /\.lovable\.app$/
   ],
   methods: ["GET", "POST"],
   allowedHeaders: ["Content-Type", "Authorization"],
@@ -41,7 +41,7 @@ app.use(express.urlencoded({ extended: true, limit: "100mb" }));
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 100 * 1024 * 1024 }, // 100MB
+  limits: { fileSize: 100 * 1024 * 1024 },
 });
 
 // ---------- Helpers ----------
@@ -64,19 +64,65 @@ function sendZip(res, zip, zipName) {
   res.send(zip.toBuffer());
 }
 
+// Helper: Calcul du score de risque (0-100, 100 = safe)
+function calculateRiskScore(summary) {
+  let score = 100;
+  score -= summary.critical * 25;
+  score -= summary.high * 10;
+  score -= summary.medium * 5;
+  score -= summary.low * 2;
+  return Math.max(0, Math.min(100, score));
+}
+
+// Helper: Génération des recommandations
+function generateRecommendations(detections, summary) {
+  const recommendations = [];
+  
+  if (detections.metadata?.length > 0) {
+    recommendations.push("Remove document metadata to protect author and organization information.");
+  }
+  if (detections.comments?.length > 0) {
+    recommendations.push(`Review and remove ${detections.comments.length} comment(s) before sharing externally.`);
+  }
+  if (detections.trackChanges?.length > 0) {
+    recommendations.push("Accept or reject all tracked changes to finalize the document.");
+  }
+  if (detections.hiddenContent?.length > 0 || detections.hiddenSheets?.length > 0) {
+    recommendations.push("Remove hidden content that could expose confidential information.");
+  }
+  if (detections.macros?.length > 0) {
+    recommendations.push("Remove macros for security - they can contain executable code.");
+  }
+  if (detections.sensitiveData?.length > 0) {
+    const types = [...new Set(detections.sensitiveData.map(d => d.type))];
+    recommendations.push(`Review sensitive data detected: ${types.join(', ')}.`);
+  }
+  if (detections.embeddedObjects?.length > 0) {
+    recommendations.push("Remove embedded objects that may contain hidden data.");
+  }
+  if (detections.spellingErrors?.length > 0) {
+    recommendations.push(`${detections.spellingErrors.length} spelling/grammar issue(s) were corrected.`);
+  }
+  if (recommendations.length === 0) {
+    recommendations.push("Document appears clean. Minor review recommended before external sharing.");
+  }
+  
+  return recommendations;
+}
+
 // ---------- Health ----------
 app.get("/health", (_, res) =>
   res.json({ 
     ok: true, 
     service: "Qualion-Doc Backend", 
-    version: "2.0",
+    version: "2.1",
     endpoints: ["/analyze", "/clean", "/rephrase"],
     time: new Date().toISOString() 
   })
 );
 
 // ===================================================================
-// POST /analyze  → NOUVEAU: Analyse pour preview interactif
+// POST /analyze
 // ===================================================================
 app.post("/analyze", upload.single("file"), async (req, res) => {
   const startTime = Date.now();
@@ -97,24 +143,16 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
     
     console.log(`[ANALYZE] Processing ${req.file.originalname} (${(req.file.size / 1024).toFixed(1)} KB)`);
     
-    // Utilise ton documentAnalyzer.js existant
     const fileType = getMimeFromExt(ext);
     const detections = await analyzeDocument(req.file.buffer, fileType);
     const summary = calculateSummary(detections);
-    
-    // Calcul du risk score
     const riskScore = calculateRiskScore(summary);
     
     const result = {
-      // Identifiant unique pour cette analyse
       documentId: uuidv4(),
-      
-      // Info fichier
       fileName: req.file.originalname,
       fileType: ext,
       fileSize: req.file.size,
-      
-      // Détections (format compatible avec ton frontend Lovable)
       detections: {
         metadata: detections.metadata || [],
         comments: detections.comments || [],
@@ -130,8 +168,6 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
         businessInconsistencies: detections.businessInconsistencies || [],
         complianceRisks: detections.complianceRisks || []
       },
-      
-      // Résumé
       summary: {
         totalIssues: summary.totalIssues,
         critical: summary.critical,
@@ -139,10 +175,9 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
         medium: summary.medium,
         low: summary.low,
         riskScore: riskScore,
+        riskLevel: riskScore >= 90 ? 'safe' : riskScore >= 70 ? 'low' : riskScore >= 50 ? 'medium' : riskScore >= 25 ? 'high' : 'critical',
         recommendations: generateRecommendations(detections, summary)
       },
-      
-      // Performance
       processingTime: Date.now() - startTime
     };
     
@@ -156,62 +191,8 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
   }
 });
 
-// Helper: Calcul du score de risque (0-100, 100 = safe)
-function calculateRiskScore(summary) {
-  let score = 100;
-  
-  // Déductions basées sur la sévérité
-  score -= summary.critical * 25;
-  score -= summary.high * 10;
-  score -= summary.medium * 5;
-  score -= summary.low * 2;
-  
-  // Minimum 0, maximum 100
-  return Math.max(0, Math.min(100, score));
-}
-
-// Helper: Génération des recommandations
-function generateRecommendations(detections, summary) {
-  const recommendations = [];
-  
-  if (detections.metadata?.length > 0) {
-    recommendations.push("Remove document metadata to protect author and organization information.");
-  }
-  
-  if (detections.comments?.length > 0) {
-    recommendations.push(`Review and remove ${detections.comments.length} comment(s) before sharing externally.`);
-  }
-  
-  if (detections.trackChanges?.length > 0) {
-    recommendations.push("Accept or reject all tracked changes to finalize the document.");
-  }
-  
-  if (detections.hiddenContent?.length > 0 || detections.hiddenSheets?.length > 0) {
-    recommendations.push("Remove hidden content that could expose confidential information.");
-  }
-  
-  if (detections.macros?.length > 0) {
-    recommendations.push("Remove macros for security - they can contain executable code.");
-  }
-  
-  if (detections.sensitiveData?.length > 0) {
-    const types = [...new Set(detections.sensitiveData.map(d => d.type))];
-    recommendations.push(`Review sensitive data detected: ${types.join(', ')}.`);
-  }
-  
-  if (detections.embeddedObjects?.length > 0) {
-    recommendations.push("Remove embedded objects that may contain hidden data.");
-  }
-  
-  if (recommendations.length === 0) {
-    recommendations.push("Document appears clean. Minor review recommended before external sharing.");
-  }
-  
-  return recommendations;
-}
-
 // ===================================================================
-// POST /clean  → EXISTANT (ton code actuel, gardé tel quel)
+// POST /clean  → MISE À JOUR AVEC SPELLING ERRORS DANS LE RAPPORT
 // ===================================================================
 app.post("/clean", upload.any(), async (req, res) => {
   try {
@@ -222,7 +203,6 @@ app.post("/clean", upload.any(), async (req, res) => {
     const pdfMode = (req.body.pdfMode || "sanitize").toLowerCase();
     const includePdfDocx = String(req.body.pdfDocx || "false") === "true";
     
-    // NOUVELLES OPTIONS pour nettoyage granulaire
     const cleaningOptions = {
       removeMetadata: req.body.removeMetadata !== "false",
       removeComments: req.body.removeComments !== "false",
@@ -242,10 +222,35 @@ app.post("/clean", upload.any(), async (req, res) => {
 
       console.log(`[CLEAN] Processing ${f.originalname} with options:`, cleaningOptions);
 
+      // ============================================================
+      // NOUVEAU: Analyser le document AVANT le nettoyage pour avoir
+      // les spellingErrors et le summary pour le rapport
+      // ============================================================
+      let analysisResult = null;
+      try {
+        const fileType = getMimeFromExt(ext);
+        const detections = await analyzeDocument(f.buffer, fileType);
+        const summary = calculateSummary(detections);
+        const riskScore = calculateRiskScore(summary);
+        
+        analysisResult = {
+          detections,
+          summary: {
+            ...summary,
+            riskScore,
+            riskLevel: riskScore >= 90 ? 'safe' : riskScore >= 70 ? 'low' : riskScore >= 50 ? 'medium' : riskScore >= 25 ? 'high' : 'critical',
+            recommendations: generateRecommendations(detections, summary)
+          }
+        };
+        
+        console.log(`[CLEAN] Analysis found ${detections.spellingErrors?.length || 0} spelling errors`);
+      } catch (analysisError) {
+        console.warn(`[CLEAN] Analysis failed, continuing without:`, analysisError.message);
+      }
+
       if (ext === "docx") {
         const cleaned = await cleanDOCX(f.buffer, { drawPolicy, ...cleaningOptions });
         
-        // Correction IA seulement si demandée
         let finalBuffer = cleaned.outBuffer;
         let correctionStats = null;
         
@@ -257,12 +262,15 @@ app.post("/clean", upload.any(), async (req, res) => {
 
         zip.addFile(outName(single, base, "cleaned.docx"), finalBuffer);
 
+        // MISE À JOUR: Passer analysis et spellingErrors au rapport
         const report = buildReportHtmlDetailed({
           filename: f.originalname,
           ext,
           policy: { drawPolicy, ...cleaningOptions },
           cleaning: cleaned.stats,
           correction: correctionStats,
+          analysis: analysisResult,  // ← NOUVEAU
+          spellingErrors: analysisResult?.detections?.spellingErrors || []  // ← NOUVEAU
         });
         zip.addFile(outName(single, base, "report.html"), Buffer.from(report, "utf8"));
         
@@ -280,12 +288,15 @@ app.post("/clean", upload.any(), async (req, res) => {
 
         zip.addFile(outName(single, base, "cleaned.pptx"), finalBuffer);
 
+        // MISE À JOUR: Passer analysis et spellingErrors au rapport
         const report = buildReportHtmlDetailed({
           filename: f.originalname,
           ext,
           policy: { drawPolicy, ...cleaningOptions },
           cleaning: cleaned.stats,
           correction: correctionStats,
+          analysis: analysisResult,  // ← NOUVEAU
+          spellingErrors: analysisResult?.detections?.spellingErrors || []  // ← NOUVEAU
         });
         zip.addFile(outName(single, base, "report.html"), Buffer.from(report, "utf8"));
         
@@ -317,12 +328,30 @@ app.post("/clean", upload.any(), async (req, res) => {
           };
         }
 
+        // MISE À JOUR: Passer analysis et spellingErrors au rapport
         const report = buildReportHtmlDetailed({
           filename: f.originalname,
           ext,
           policy: { pdfMode, ...cleaningOptions },
           cleaning: cleaned.stats,
           correction: correctionStats,
+          analysis: analysisResult,  // ← NOUVEAU
+          spellingErrors: analysisResult?.detections?.spellingErrors || []  // ← NOUVEAU
+        });
+        zip.addFile(outName(single, base, "report.html"), Buffer.from(report, "utf8"));
+        
+      } else if (ext === "xlsx") {
+        // Pour Excel, on ajoute juste le fichier tel quel pour l'instant
+        zip.addFile(outName(single, base, f.originalname), f.buffer);
+        
+        const report = buildReportHtmlDetailed({
+          filename: f.originalname,
+          ext,
+          policy: cleaningOptions,
+          cleaning: {},
+          correction: null,
+          analysis: analysisResult,  // ← NOUVEAU
+          spellingErrors: analysisResult?.detections?.spellingErrors || []  // ← NOUVEAU
         });
         zip.addFile(outName(single, base, "report.html"), Buffer.from(report, "utf8"));
         
@@ -334,6 +363,8 @@ app.post("/clean", upload.any(), async (req, res) => {
           policy: {},
           cleaning: {},
           correction: null,
+          analysis: null,
+          spellingErrors: []
         });
         zip.addFile(outName(single, base, "report.html"), Buffer.from(report, "utf8"));
       }
@@ -351,7 +382,7 @@ app.post("/clean", upload.any(), async (req, res) => {
 });
 
 // ===================================================================
-// POST /rephrase  → EXISTANT (gardé tel quel)
+// POST /rephrase
 // ===================================================================
 app.post("/rephrase", upload.any(), async (req, res) => {
   try {
@@ -365,6 +396,27 @@ app.post("/rephrase", upload.any(), async (req, res) => {
     for (const f of files) {
       const ext = getExt(f.originalname);
       const base = path.parse(f.originalname).name;
+
+      // Analyse pour le rapport
+      let analysisResult = null;
+      try {
+        const fileType = getMimeFromExt(ext);
+        const detections = await analyzeDocument(f.buffer, fileType);
+        const summary = calculateSummary(detections);
+        const riskScore = calculateRiskScore(summary);
+        
+        analysisResult = {
+          detections,
+          summary: {
+            ...summary,
+            riskScore,
+            riskLevel: riskScore >= 90 ? 'safe' : riskScore >= 70 ? 'low' : riskScore >= 50 ? 'medium' : riskScore >= 25 ? 'high' : 'critical',
+            recommendations: generateRecommendations(detections, summary)
+          }
+        };
+      } catch (analysisError) {
+        console.warn(`[REPHRASE] Analysis failed:`, analysisError.message);
+      }
 
       if (ext === "docx") {
         const cleaned = await cleanDOCX(f.buffer, { drawPolicy });
@@ -380,6 +432,8 @@ app.post("/rephrase", upload.any(), async (req, res) => {
           policy: { drawPolicy, mode: "rephrase" },
           cleaning: cleaned.stats,
           correction: rephrased.stats,
+          analysis: analysisResult,
+          spellingErrors: analysisResult?.detections?.spellingErrors || []
         });
         zip.addFile(outName(single, base, "report.html"), Buffer.from(report, "utf8"));
         
@@ -397,6 +451,8 @@ app.post("/rephrase", upload.any(), async (req, res) => {
           policy: { drawPolicy, mode: "rephrase" },
           cleaning: cleaned.stats,
           correction: rephrased.stats,
+          analysis: analysisResult,
+          spellingErrors: analysisResult?.detections?.spellingErrors || []
         });
         zip.addFile(outName(single, base, "report.html"), Buffer.from(report, "utf8"));
         
@@ -421,7 +477,6 @@ app.post("/rephrase", upload.any(), async (req, res) => {
 // ---------- Boot ----------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`✅ Qualion-Doc Backend v2.0 listening on port ${PORT}`);
+  console.log(`✅ Qualion-Doc Backend v2.1 listening on port ${PORT}`);
   console.log(`   Endpoints: GET /health, POST /analyze, POST /clean, POST /rephrase`);
 });
-
