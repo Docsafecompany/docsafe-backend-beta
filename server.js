@@ -1,4 +1,4 @@
-// server.js - VERSION FINALE AVEC /analyze ET SPELLING ERRORS DANS REPORTS
+// server.js - VERSION 2.2 avec spellingErrors passés aux fonctions de correction
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -7,7 +7,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { v4 as uuidv4 } from "uuid";
 
-// Tes imports existants
+// Imports existants
 import { cleanDOCX } from "./lib/docxCleaner.js";
 import { cleanPPTX } from "./lib/pptxCleaner.js";
 import { cleanPDF } from "./lib/pdfCleaner.js";
@@ -17,7 +17,7 @@ import { extractPdfText, filterExtractedLines } from "./lib/pdfTools.js";
 import { createDocxFromText } from "./lib/docxWriter.js";
 import { aiCorrectText } from "./lib/ai.js";
 
-// NOUVEAU: Import de documentAnalyzer
+// Import de documentAnalyzer
 import { analyzeDocument, calculateSummary } from "./lib/documentAnalyzer.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -67,10 +67,10 @@ function sendZip(res, zip, zipName) {
 // Helper: Calcul du score de risque (0-100, 100 = safe)
 function calculateRiskScore(summary) {
   let score = 100;
-  score -= summary.critical * 25;
-  score -= summary.high * 10;
-  score -= summary.medium * 5;
-  score -= summary.low * 2;
+  score -= (summary.critical || 0) * 25;
+  score -= (summary.high || 0) * 10;
+  score -= (summary.medium || 0) * 5;
+  score -= (summary.low || 0) * 2;
   return Math.max(0, Math.min(100, score));
 }
 
@@ -115,7 +115,7 @@ app.get("/health", (_, res) =>
   res.json({ 
     ok: true, 
     service: "Qualion-Doc Backend", 
-    version: "2.1",
+    version: "2.2",
     endpoints: ["/analyze", "/clean", "/rephrase"],
     time: new Date().toISOString() 
   })
@@ -192,7 +192,7 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
 });
 
 // ===================================================================
-// POST /clean  → MISE À JOUR AVEC SPELLING ERRORS DANS LE RAPPORT
+// POST /clean  → VERSION 2.2 avec spellingErrors passés aux corrections
 // ===================================================================
 app.post("/clean", upload.any(), async (req, res) => {
   try {
@@ -223,15 +223,20 @@ app.post("/clean", upload.any(), async (req, res) => {
       console.log(`[CLEAN] Processing ${f.originalname} with options:`, cleaningOptions);
 
       // ============================================================
-      // NOUVEAU: Analyser le document AVANT le nettoyage pour avoir
+      // ÉTAPE 1: Analyser le document AVANT le nettoyage pour avoir
       // les spellingErrors et le summary pour le rapport
       // ============================================================
       let analysisResult = null;
+      let spellingErrors = [];
+      
       try {
         const fileType = getMimeFromExt(ext);
         const detections = await analyzeDocument(f.buffer, fileType);
         const summary = calculateSummary(detections);
         const riskScore = calculateRiskScore(summary);
+        
+        // Extraire les spellingErrors pour les passer aux fonctions de correction
+        spellingErrors = detections.spellingErrors || [];
         
         analysisResult = {
           detections,
@@ -243,11 +248,14 @@ app.post("/clean", upload.any(), async (req, res) => {
           }
         };
         
-        console.log(`[CLEAN] Analysis found ${detections.spellingErrors?.length || 0} spelling errors`);
+        console.log(`[CLEAN] Analysis found ${spellingErrors.length} spelling errors to apply`);
       } catch (analysisError) {
         console.warn(`[CLEAN] Analysis failed, continuing without:`, analysisError.message);
       }
 
+      // ============================================================
+      // TRAITEMENT DOCX
+      // ============================================================
       if (ext === "docx") {
         const cleaned = await cleanDOCX(f.buffer, { drawPolicy, ...cleaningOptions });
         
@@ -255,25 +263,32 @@ app.post("/clean", upload.any(), async (req, res) => {
         let correctionStats = null;
         
         if (cleaningOptions.correctSpelling) {
-          const corrected = await correctDOCXText(cleaned.outBuffer, aiCorrectText);
+          // ✅ MODIFICATION: Passer les spellingErrors à correctDOCXText
+          const corrected = await correctDOCXText(cleaned.outBuffer, aiCorrectText, {
+            spellingErrors: spellingErrors  // ← NOUVEAU: passer les erreurs détectées
+          });
           finalBuffer = corrected.outBuffer;
           correctionStats = corrected.stats;
+          
+          console.log(`[CLEAN DOCX] Applied ${correctionStats.changedTextNodes} corrections`);
         }
 
         zip.addFile(outName(single, base, "cleaned.docx"), finalBuffer);
 
-        // MISE À JOUR: Passer analysis et spellingErrors au rapport
         const report = buildReportHtmlDetailed({
           filename: f.originalname,
           ext,
           policy: { drawPolicy, ...cleaningOptions },
           cleaning: cleaned.stats,
           correction: correctionStats,
-          analysis: analysisResult,  // ← NOUVEAU
-          spellingErrors: analysisResult?.detections?.spellingErrors || []  // ← NOUVEAU
+          analysis: analysisResult,
+          spellingErrors: spellingErrors
         });
         zip.addFile(outName(single, base, "report.html"), Buffer.from(report, "utf8"));
         
+      // ============================================================
+      // TRAITEMENT PPTX
+      // ============================================================
       } else if (ext === "pptx") {
         const cleaned = await cleanPPTX(f.buffer, { drawPolicy, ...cleaningOptions });
         
@@ -281,25 +296,32 @@ app.post("/clean", upload.any(), async (req, res) => {
         let correctionStats = null;
         
         if (cleaningOptions.correctSpelling) {
-          const corrected = await correctPPTXText(cleaned.outBuffer, aiCorrectText);
+          // ✅ MODIFICATION: Passer les spellingErrors à correctPPTXText
+          const corrected = await correctPPTXText(cleaned.outBuffer, aiCorrectText, {
+            spellingErrors: spellingErrors  // ← NOUVEAU: passer les erreurs détectées
+          });
           finalBuffer = corrected.outBuffer;
           correctionStats = corrected.stats;
+          
+          console.log(`[CLEAN PPTX] Applied ${correctionStats.changedTextNodes} corrections`);
         }
 
         zip.addFile(outName(single, base, "cleaned.pptx"), finalBuffer);
 
-        // MISE À JOUR: Passer analysis et spellingErrors au rapport
         const report = buildReportHtmlDetailed({
           filename: f.originalname,
           ext,
           policy: { drawPolicy, ...cleaningOptions },
           cleaning: cleaned.stats,
           correction: correctionStats,
-          analysis: analysisResult,  // ← NOUVEAU
-          spellingErrors: analysisResult?.detections?.spellingErrors || []  // ← NOUVEAU
+          analysis: analysisResult,
+          spellingErrors: spellingErrors
         });
         zip.addFile(outName(single, base, "report.html"), Buffer.from(report, "utf8"));
         
+      // ============================================================
+      // TRAITEMENT PDF
+      // ============================================================
       } else if (ext === "pdf") {
         const cleaned = await cleanPDF(f.buffer, {
           pdfMode: pdfMode === "text-only" ? "text-only" : "sanitize",
@@ -328,18 +350,20 @@ app.post("/clean", upload.any(), async (req, res) => {
           };
         }
 
-        // MISE À JOUR: Passer analysis et spellingErrors au rapport
         const report = buildReportHtmlDetailed({
           filename: f.originalname,
           ext,
           policy: { pdfMode, ...cleaningOptions },
           cleaning: cleaned.stats,
           correction: correctionStats,
-          analysis: analysisResult,  // ← NOUVEAU
-          spellingErrors: analysisResult?.detections?.spellingErrors || []  // ← NOUVEAU
+          analysis: analysisResult,
+          spellingErrors: spellingErrors
         });
         zip.addFile(outName(single, base, "report.html"), Buffer.from(report, "utf8"));
         
+      // ============================================================
+      // TRAITEMENT XLSX
+      // ============================================================
       } else if (ext === "xlsx") {
         // Pour Excel, on ajoute juste le fichier tel quel pour l'instant
         zip.addFile(outName(single, base, f.originalname), f.buffer);
@@ -350,11 +374,14 @@ app.post("/clean", upload.any(), async (req, res) => {
           policy: cleaningOptions,
           cleaning: {},
           correction: null,
-          analysis: analysisResult,  // ← NOUVEAU
-          spellingErrors: analysisResult?.detections?.spellingErrors || []  // ← NOUVEAU
+          analysis: analysisResult,
+          spellingErrors: spellingErrors
         });
         zip.addFile(outName(single, base, "report.html"), Buffer.from(report, "utf8"));
         
+      // ============================================================
+      // AUTRES TYPES
+      // ============================================================
       } else {
         zip.addFile(outName(single, base, f.originalname), f.buffer);
         const report = buildReportHtmlDetailed({
@@ -399,11 +426,15 @@ app.post("/rephrase", upload.any(), async (req, res) => {
 
       // Analyse pour le rapport
       let analysisResult = null;
+      let spellingErrors = [];
+      
       try {
         const fileType = getMimeFromExt(ext);
         const detections = await analyzeDocument(f.buffer, fileType);
         const summary = calculateSummary(detections);
         const riskScore = calculateRiskScore(summary);
+        
+        spellingErrors = detections.spellingErrors || [];
         
         analysisResult = {
           detections,
@@ -420,8 +451,11 @@ app.post("/rephrase", upload.any(), async (req, res) => {
 
       if (ext === "docx") {
         const cleaned = await cleanDOCX(f.buffer, { drawPolicy });
+        
+        // ✅ MODIFICATION: Passer les spellingErrors à correctDOCXText pour rephrase
         const rephrased = await correctDOCXText(cleaned.outBuffer, aiCorrectText, {
           mode: "rephrase",
+          spellingErrors: spellingErrors
         });
 
         zip.addFile(outName(single, base, "rephrased.docx"), rephrased.outBuffer);
@@ -433,14 +467,17 @@ app.post("/rephrase", upload.any(), async (req, res) => {
           cleaning: cleaned.stats,
           correction: rephrased.stats,
           analysis: analysisResult,
-          spellingErrors: analysisResult?.detections?.spellingErrors || []
+          spellingErrors: spellingErrors
         });
         zip.addFile(outName(single, base, "report.html"), Buffer.from(report, "utf8"));
         
       } else if (ext === "pptx") {
         const cleaned = await cleanPPTX(f.buffer, { drawPolicy });
+        
+        // ✅ MODIFICATION: Passer les spellingErrors à correctPPTXText pour rephrase
         const rephrased = await correctPPTXText(cleaned.outBuffer, aiCorrectText, {
           mode: "rephrase",
+          spellingErrors: spellingErrors
         });
 
         zip.addFile(outName(single, base, "rephrased.pptx"), rephrased.outBuffer);
@@ -452,7 +489,7 @@ app.post("/rephrase", upload.any(), async (req, res) => {
           cleaning: cleaned.stats,
           correction: rephrased.stats,
           analysis: analysisResult,
-          spellingErrors: analysisResult?.detections?.spellingErrors || []
+          spellingErrors: spellingErrors
         });
         zip.addFile(outName(single, base, "report.html"), Buffer.from(report, "utf8"));
         
@@ -477,6 +514,8 @@ app.post("/rephrase", upload.any(), async (req, res) => {
 // ---------- Boot ----------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`✅ Qualion-Doc Backend v2.1 listening on port ${PORT}`);
+  console.log(`✅ Qualion-Doc Backend v2.2 listening on port ${PORT}`);
   console.log(`   Endpoints: GET /health, POST /analyze, POST /clean, POST /rephrase`);
+  console.log(`   Spelling corrections: ENABLED (passed to correction functions)`);
 });
+
