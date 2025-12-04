@@ -1,4 +1,4 @@
-// server.js - VERSION 2.3 avec report.json pour PremiumSecurityReport
+// server.js - VERSION 2.4 avec score de risque corrigé
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -12,7 +12,7 @@ import { cleanDOCX } from "./lib/docxCleaner.js";
 import { cleanPPTX } from "./lib/pptxCleaner.js";
 import { cleanPDF } from "./lib/pdfCleaner.js";
 import { correctDOCXText, correctPPTXText } from "./lib/officeCorrect.js";
-import { buildReportHtmlDetailed, buildReportData } from "./lib/report.js"; // ← AJOUT: buildReportData
+import { buildReportHtmlDetailed, buildReportData } from "./lib/report.js";
 import { extractPdfText, filterExtractedLines } from "./lib/pdfTools.js";
 import { createDocxFromText } from "./lib/docxWriter.js";
 import { aiCorrectText } from "./lib/ai.js";
@@ -64,14 +64,101 @@ function sendZip(res, zip, zipName) {
   res.send(zip.toBuffer());
 }
 
-// Helper: Calcul du score de risque AVANT nettoyage (0-100, 100 = safe)
-function calculateRiskScore(summary) {
+// ============================================================
+// CORRECTION: Calcul du score de risque basé sur les détections
+// Score 0-100 où 100 = document sûr, 0 = risque critique
+// ============================================================
+function calculateRiskScore(summary, detections = null) {
   let score = 100;
+  
+  // 1. Pénalités par sévérité classifiée (si disponible)
   score -= (summary.critical || 0) * 25;
   score -= (summary.high || 0) * 10;
   score -= (summary.medium || 0) * 5;
   score -= (summary.low || 0) * 2;
-  return Math.max(0, Math.min(100, score));
+  
+  // 2. NOUVEAU: Si detections fourni, calculer les pénalités par type
+  if (detections) {
+    // Sensitive Data = CRITICAL (-25 par item, max -50)
+    const sensitiveCount = detections.sensitiveData?.length || 0;
+    if (sensitiveCount > 0) {
+      score -= Math.min(sensitiveCount * 25, 50);
+    }
+    
+    // Macros = HIGH (-15 par item, max -30)
+    const macrosCount = detections.macros?.length || 0;
+    if (macrosCount > 0) {
+      score -= Math.min(macrosCount * 15, 30);
+    }
+    
+    // Hidden Content = MEDIUM (-8 par item, max -24)
+    const hiddenCount = (detections.hiddenContent?.length || 0) + 
+                        (detections.hiddenSheets?.length || 0);
+    if (hiddenCount > 0) {
+      score -= Math.min(hiddenCount * 8, 24);
+    }
+    
+    // Comments = LOW (-3 par item, max -15)
+    const commentsCount = detections.comments?.length || 0;
+    if (commentsCount > 0) {
+      score -= Math.min(commentsCount * 3, 15);
+    }
+    
+    // Track Changes = LOW (-3 par item, max -15)
+    const trackChangesCount = detections.trackChanges?.length || 0;
+    if (trackChangesCount > 0) {
+      score -= Math.min(trackChangesCount * 3, 15);
+    }
+    
+    // Metadata = LOW (-2 par item, max -10)
+    const metadataCount = detections.metadata?.length || 0;
+    if (metadataCount > 0) {
+      score -= Math.min(metadataCount * 2, 10);
+    }
+    
+    // Embedded Objects = MEDIUM (-5 par item, max -15)
+    const embeddedCount = detections.embeddedObjects?.length || 0;
+    if (embeddedCount > 0) {
+      score -= Math.min(embeddedCount * 5, 15);
+    }
+    
+    // Spelling Errors = LOW (-1 par item, max -10)
+    const spellingCount = detections.spellingErrors?.length || 0;
+    if (spellingCount > 0) {
+      score -= Math.min(spellingCount * 1, 10);
+    }
+    
+    // Broken Links = MEDIUM (-4 par item, max -12)
+    const brokenLinksCount = detections.brokenLinks?.length || 0;
+    if (brokenLinksCount > 0) {
+      score -= Math.min(brokenLinksCount * 4, 12);
+    }
+    
+    // Compliance Risks = HIGH (-12 par item, max -36)
+    const complianceCount = detections.complianceRisks?.length || 0;
+    if (complianceCount > 0) {
+      score -= Math.min(complianceCount * 12, 36);
+    }
+  } else {
+    // 3. Fallback: Si pas de detections, utiliser totalIssues
+    const classifiedIssues = (summary.critical || 0) + (summary.high || 0) + 
+                            (summary.medium || 0) + (summary.low || 0);
+    const unclassifiedIssues = Math.max(0, (summary.totalIssues || 0) - classifiedIssues);
+    
+    // Chaque issue non classifiée = -5 points (considérée medium par défaut)
+    score -= unclassifiedIssues * 5;
+  }
+  
+  // 4. Pénalité supplémentaire si beaucoup d'issues totales
+  if (summary.totalIssues > 10) {
+    score -= (summary.totalIssues - 10) * 2;
+  }
+  
+  const finalScore = Math.max(0, Math.min(100, score));
+  
+  console.log(`[RISK SCORE] Calculated: ${finalScore} (total issues: ${summary.totalIssues})`);
+  
+  return finalScore;
 }
 
 // Helper: Calcul du score APRÈS nettoyage (toujours meilleur)
@@ -133,6 +220,15 @@ function generateRecommendations(detections, summary) {
   return recommendations;
 }
 
+// Helper: Déterminer le niveau de risque à partir du score
+function getRiskLevel(score) {
+  if (score >= 90) return 'safe';
+  if (score >= 70) return 'low';
+  if (score >= 50) return 'medium';
+  if (score >= 25) return 'high';
+  return 'critical';
+}
+
 // Helper: Ajouter les deux rapports (HTML + JSON) au ZIP
 function addReportsToZip(zip, single, base, reportParams) {
   // Générer le rapport HTML (legacy)
@@ -151,15 +247,15 @@ app.get("/health", (_, res) =>
   res.json({ 
     ok: true, 
     service: "Qualion-Doc Backend", 
-    version: "2.3",
+    version: "2.4",
     endpoints: ["/analyze", "/clean", "/rephrase"],
-    features: ["spelling-correction", "premium-json-report"],
+    features: ["spelling-correction", "premium-json-report", "accurate-risk-score"],
     time: new Date().toISOString() 
   })
 );
 
 // ===================================================================
-// POST /analyze
+// POST /analyze - VERSION 2.4 avec score corrigé
 // ===================================================================
 app.post("/analyze", upload.single("file"), async (req, res) => {
   const startTime = Date.now();
@@ -183,7 +279,9 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
     const fileType = getMimeFromExt(ext);
     const detections = await analyzeDocument(req.file.buffer, fileType);
     const summary = calculateSummary(detections);
-    const riskScore = calculateRiskScore(summary);
+    
+    // ✅ CORRECTION: Passer les detections pour un score précis
+    const riskScore = calculateRiskScore(summary, detections);
     
     const result = {
       documentId: uuidv4(),
@@ -212,13 +310,13 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
         medium: summary.medium,
         low: summary.low,
         riskScore: riskScore,
-        riskLevel: riskScore >= 90 ? 'safe' : riskScore >= 70 ? 'low' : riskScore >= 50 ? 'medium' : riskScore >= 25 ? 'high' : 'critical',
+        riskLevel: getRiskLevel(riskScore),
         recommendations: generateRecommendations(detections, summary)
       },
       processingTime: Date.now() - startTime
     };
     
-    console.log(`[ANALYZE] Complete in ${result.processingTime}ms - ${summary.totalIssues} issues found, risk score: ${riskScore}`);
+    console.log(`[ANALYZE] Complete in ${result.processingTime}ms - ${summary.totalIssues} issues found, risk score: ${riskScore} (${getRiskLevel(riskScore)})`);
     
     res.json(result);
     
@@ -229,7 +327,7 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
 });
 
 // ===================================================================
-// POST /clean  → VERSION 2.3 avec report.json
+// POST /clean  → VERSION 2.4 avec score corrigé
 // ===================================================================
 app.post("/clean", upload.any(), async (req, res) => {
   try {
@@ -265,12 +363,15 @@ app.post("/clean", upload.any(), async (req, res) => {
       let analysisResult = null;
       let spellingErrors = [];
       let beforeRiskScore = 100;
+      let detections = null;
       
       try {
         const fileType = getMimeFromExt(ext);
-        const detections = await analyzeDocument(f.buffer, fileType);
+        detections = await analyzeDocument(f.buffer, fileType);
         const summary = calculateSummary(detections);
-        beforeRiskScore = calculateRiskScore(summary);
+        
+        // ✅ CORRECTION: Passer les detections pour un score précis
+        beforeRiskScore = calculateRiskScore(summary, detections);
         
         spellingErrors = detections.spellingErrors || [];
         
@@ -279,13 +380,13 @@ app.post("/clean", upload.any(), async (req, res) => {
           summary: {
             ...summary,
             riskScore: beforeRiskScore,
-            beforeRiskScore: beforeRiskScore, // ← NOUVEAU: score avant nettoyage
-            riskLevel: beforeRiskScore >= 90 ? 'safe' : beforeRiskScore >= 70 ? 'low' : beforeRiskScore >= 50 ? 'medium' : beforeRiskScore >= 25 ? 'high' : 'critical',
+            beforeRiskScore: beforeRiskScore,
+            riskLevel: getRiskLevel(beforeRiskScore),
             recommendations: generateRecommendations(detections, summary)
           }
         };
         
-        console.log(`[CLEAN] Analysis found ${spellingErrors.length} spelling errors, before score: ${beforeRiskScore}`);
+        console.log(`[CLEAN] Analysis found ${spellingErrors.length} spelling errors, before score: ${beforeRiskScore} (${getRiskLevel(beforeRiskScore)})`);
       } catch (analysisError) {
         console.warn(`[CLEAN] Analysis failed, continuing without:`, analysisError.message);
       }
@@ -465,7 +566,7 @@ app.post("/clean", upload.any(), async (req, res) => {
 });
 
 // ===================================================================
-// POST /rephrase
+// POST /rephrase - VERSION 2.4 avec score corrigé
 // ===================================================================
 app.post("/rephrase", upload.any(), async (req, res) => {
   try {
@@ -484,12 +585,15 @@ app.post("/rephrase", upload.any(), async (req, res) => {
       let analysisResult = null;
       let spellingErrors = [];
       let beforeRiskScore = 100;
+      let detections = null;
       
       try {
         const fileType = getMimeFromExt(ext);
-        const detections = await analyzeDocument(f.buffer, fileType);
+        detections = await analyzeDocument(f.buffer, fileType);
         const summary = calculateSummary(detections);
-        beforeRiskScore = calculateRiskScore(summary);
+        
+        // ✅ CORRECTION: Passer les detections pour un score précis
+        beforeRiskScore = calculateRiskScore(summary, detections);
         
         spellingErrors = detections.spellingErrors || [];
         
@@ -499,7 +603,7 @@ app.post("/rephrase", upload.any(), async (req, res) => {
             ...summary,
             riskScore: beforeRiskScore,
             beforeRiskScore: beforeRiskScore,
-            riskLevel: beforeRiskScore >= 90 ? 'safe' : beforeRiskScore >= 70 ? 'low' : beforeRiskScore >= 50 ? 'medium' : beforeRiskScore >= 25 ? 'high' : 'critical',
+            riskLevel: getRiskLevel(beforeRiskScore),
             recommendations: generateRecommendations(detections, summary)
           }
         };
@@ -578,7 +682,7 @@ app.post("/rephrase", upload.any(), async (req, res) => {
 // ---------- Boot ----------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`✅ Qualion-Doc Backend v2.3 listening on port ${PORT}`);
+  console.log(`✅ Qualion-Doc Backend v2.4 listening on port ${PORT}`);
   console.log(`   Endpoints: GET /health, POST /analyze, POST /clean, POST /rephrase`);
-  console.log(`   Features: Spelling corrections, Premium JSON reports`);
+  console.log(`   Features: Spelling corrections, Premium JSON reports, Accurate risk scoring`);
 });
