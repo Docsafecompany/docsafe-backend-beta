@@ -1,4 +1,4 @@
-// server.js - VERSION 2.4 avec score de risque corrigé
+// server.js - VERSION 2.5 avec scoreImpacts pour before/after détaillé
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -65,79 +65,117 @@ function sendZip(res, zip, zipName) {
 }
 
 // ============================================================
-// CORRECTION: Calcul du score de risque basé sur les détections
+// Calcul du score de risque basé sur les détections
 // Score 0-100 où 100 = document sûr, 0 = risque critique
+// Retourne aussi le breakdown des pénalités par catégorie
 // ============================================================
 function calculateRiskScore(summary, detections = null) {
   let score = 100;
+  const breakdown = {};
   
   // 1. Pénalités par sévérité classifiée (si disponible)
-  score -= (summary.critical || 0) * 25;
-  score -= (summary.high || 0) * 10;
-  score -= (summary.medium || 0) * 5;
-  score -= (summary.low || 0) * 2;
+  if (summary.critical > 0) {
+    const penalty = summary.critical * 25;
+    score -= penalty;
+    breakdown.critical = penalty;
+  }
+  if (summary.high > 0) {
+    const penalty = summary.high * 10;
+    score -= penalty;
+    breakdown.high = penalty;
+  }
+  if (summary.medium > 0) {
+    const penalty = summary.medium * 5;
+    score -= penalty;
+    breakdown.medium = penalty;
+  }
+  if (summary.low > 0) {
+    const penalty = summary.low * 2;
+    score -= penalty;
+    breakdown.low = penalty;
+  }
   
-  // 2. NOUVEAU: Si detections fourni, calculer les pénalités par type
+  // 2. Si detections fourni, calculer les pénalités par type
   if (detections) {
     // Sensitive Data = CRITICAL (-25 par item, max -50)
     const sensitiveCount = detections.sensitiveData?.length || 0;
     if (sensitiveCount > 0) {
-      score -= Math.min(sensitiveCount * 25, 50);
+      const penalty = Math.min(sensitiveCount * 25, 50);
+      score -= penalty;
+      breakdown.sensitiveData = penalty;
     }
     
     // Macros = HIGH (-15 par item, max -30)
     const macrosCount = detections.macros?.length || 0;
     if (macrosCount > 0) {
-      score -= Math.min(macrosCount * 15, 30);
+      const penalty = Math.min(macrosCount * 15, 30);
+      score -= penalty;
+      breakdown.macros = penalty;
     }
     
     // Hidden Content = MEDIUM (-8 par item, max -24)
     const hiddenCount = (detections.hiddenContent?.length || 0) + 
                         (detections.hiddenSheets?.length || 0);
     if (hiddenCount > 0) {
-      score -= Math.min(hiddenCount * 8, 24);
+      const penalty = Math.min(hiddenCount * 8, 24);
+      score -= penalty;
+      breakdown.hiddenContent = penalty;
     }
     
     // Comments = LOW (-3 par item, max -15)
     const commentsCount = detections.comments?.length || 0;
     if (commentsCount > 0) {
-      score -= Math.min(commentsCount * 3, 15);
+      const penalty = Math.min(commentsCount * 3, 15);
+      score -= penalty;
+      breakdown.comments = penalty;
     }
     
     // Track Changes = LOW (-3 par item, max -15)
     const trackChangesCount = detections.trackChanges?.length || 0;
     if (trackChangesCount > 0) {
-      score -= Math.min(trackChangesCount * 3, 15);
+      const penalty = Math.min(trackChangesCount * 3, 15);
+      score -= penalty;
+      breakdown.trackChanges = penalty;
     }
     
     // Metadata = LOW (-2 par item, max -10)
     const metadataCount = detections.metadata?.length || 0;
     if (metadataCount > 0) {
-      score -= Math.min(metadataCount * 2, 10);
+      const penalty = Math.min(metadataCount * 2, 10);
+      score -= penalty;
+      breakdown.metadata = penalty;
     }
     
     // Embedded Objects = MEDIUM (-5 par item, max -15)
     const embeddedCount = detections.embeddedObjects?.length || 0;
     if (embeddedCount > 0) {
-      score -= Math.min(embeddedCount * 5, 15);
+      const penalty = Math.min(embeddedCount * 5, 15);
+      score -= penalty;
+      breakdown.embeddedObjects = penalty;
     }
     
     // Spelling Errors = LOW (-1 par item, max -10)
     const spellingCount = detections.spellingErrors?.length || 0;
     if (spellingCount > 0) {
-      score -= Math.min(spellingCount * 1, 10);
+      const penalty = Math.min(spellingCount * 1, 10);
+      score -= penalty;
+      breakdown.spellingGrammar = penalty;
     }
     
     // Broken Links = MEDIUM (-4 par item, max -12)
     const brokenLinksCount = detections.brokenLinks?.length || 0;
     if (brokenLinksCount > 0) {
-      score -= Math.min(brokenLinksCount * 4, 12);
+      const penalty = Math.min(brokenLinksCount * 4, 12);
+      score -= penalty;
+      breakdown.brokenLinks = penalty;
     }
     
     // Compliance Risks = HIGH (-12 par item, max -36)
     const complianceCount = detections.complianceRisks?.length || 0;
     if (complianceCount > 0) {
-      score -= Math.min(complianceCount * 12, 36);
+      const penalty = Math.min(complianceCount * 12, 36);
+      score -= penalty;
+      breakdown.complianceRisks = penalty;
     }
   } else {
     // 3. Fallback: Si pas de detections, utiliser totalIssues
@@ -145,43 +183,123 @@ function calculateRiskScore(summary, detections = null) {
                             (summary.medium || 0) + (summary.low || 0);
     const unclassifiedIssues = Math.max(0, (summary.totalIssues || 0) - classifiedIssues);
     
-    // Chaque issue non classifiée = -5 points (considérée medium par défaut)
-    score -= unclassifiedIssues * 5;
+    if (unclassifiedIssues > 0) {
+      const penalty = unclassifiedIssues * 5;
+      score -= penalty;
+      breakdown.unclassified = penalty;
+    }
   }
   
   // 4. Pénalité supplémentaire si beaucoup d'issues totales
   if (summary.totalIssues > 10) {
-    score -= (summary.totalIssues - 10) * 2;
+    const penalty = (summary.totalIssues - 10) * 2;
+    score -= penalty;
+    breakdown.volumePenalty = penalty;
   }
   
   const finalScore = Math.max(0, Math.min(100, score));
   
-  console.log(`[RISK SCORE] Calculated: ${finalScore} (total issues: ${summary.totalIssues})`);
+  console.log(`[RISK SCORE] Calculated: ${finalScore} (total issues: ${summary.totalIssues}, breakdown:`, breakdown, ')');
   
-  return finalScore;
+  return { score: finalScore, breakdown };
 }
 
-// Helper: Calcul du score APRÈS nettoyage (toujours meilleur)
-function calculateAfterScore(beforeScore, cleaningStats, correctionStats) {
+// ============================================================
+// Calcul du score APRÈS nettoyage avec scoreImpacts détaillés
+// ============================================================
+function calculateAfterScore(beforeScore, cleaningStats, correctionStats, riskBreakdown = {}) {
   let improvement = 0;
+  const scoreImpacts = {};
   
-  // Amélioration basée sur le nettoyage effectué
-  if (cleaningStats) {
-    if (cleaningStats.metaRemoved > 0) improvement += 5;
-    if (cleaningStats.commentsXmlRemoved > 0) improvement += 10;
-    if (cleaningStats.revisionsAccepted?.total > 0) improvement += 10;
-    if (cleaningStats.hiddenRemoved > 0) improvement += 8;
-    if (cleaningStats.macrosRemoved > 0) improvement += 15;
-    if (cleaningStats.mediaDeleted > 0) improvement += 5;
+  // Récupérer les points perdus par catégorie du breakdown
+  // Et calculer combien on récupère via le nettoyage
+  
+  // Metadata supprimées → récupérer jusqu'à 100% des points perdus
+  if (cleaningStats?.metaRemoved > 0 && riskBreakdown.metadata) {
+    const impact = Math.min(cleaningStats.metaRemoved * 2, riskBreakdown.metadata);
+    improvement += impact;
+    scoreImpacts.metadata = impact;
+  } else if (cleaningStats?.metaRemoved > 0) {
+    const impact = Math.min(cleaningStats.metaRemoved * 2, 10);
+    improvement += impact;
+    scoreImpacts.metadata = impact;
   }
   
-  // Amélioration basée sur les corrections de texte
-  if (correctionStats?.changedTextNodes > 0) {
-    improvement += Math.min(correctionStats.changedTextNodes * 2, 15);
+  // Comments supprimés
+  if (cleaningStats?.commentsXmlRemoved > 0 && riskBreakdown.comments) {
+    const impact = Math.min(cleaningStats.commentsXmlRemoved * 3, riskBreakdown.comments);
+    improvement += impact;
+    scoreImpacts.comments = impact;
+  } else if (cleaningStats?.commentsXmlRemoved > 0) {
+    const impact = Math.min(cleaningStats.commentsXmlRemoved * 3, 15);
+    improvement += impact;
+    scoreImpacts.comments = impact;
+  }
+  
+  // Track Changes acceptées
+  const trackChangesTotal = (cleaningStats?.revisionsAccepted?.deletionsRemoved || 0) + 
+                           (cleaningStats?.revisionsAccepted?.insertionsUnwrapped || 0);
+  if (trackChangesTotal > 0 && riskBreakdown.trackChanges) {
+    const impact = Math.min(trackChangesTotal * 3, riskBreakdown.trackChanges);
+    improvement += impact;
+    scoreImpacts.trackChanges = impact;
+  } else if (trackChangesTotal > 0) {
+    const impact = Math.min(trackChangesTotal * 3, 15);
+    improvement += impact;
+    scoreImpacts.trackChanges = impact;
+  }
+  
+  // Hidden content supprimé
+  if (cleaningStats?.hiddenRemoved > 0 && riskBreakdown.hiddenContent) {
+    const impact = Math.min(cleaningStats.hiddenRemoved * 8, riskBreakdown.hiddenContent);
+    improvement += impact;
+    scoreImpacts.hiddenContent = impact;
+  } else if (cleaningStats?.hiddenRemoved > 0) {
+    const impact = Math.min(cleaningStats.hiddenRemoved * 8, 24);
+    improvement += impact;
+    scoreImpacts.hiddenContent = impact;
+  }
+  
+  // Macros supprimés
+  if (cleaningStats?.macrosRemoved > 0 && riskBreakdown.macros) {
+    const impact = Math.min(cleaningStats.macrosRemoved * 15, riskBreakdown.macros);
+    improvement += impact;
+    scoreImpacts.macros = impact;
+  } else if (cleaningStats?.macrosRemoved > 0) {
+    const impact = Math.min(cleaningStats.macrosRemoved * 15, 30);
+    improvement += impact;
+    scoreImpacts.macros = impact;
+  }
+  
+  // Embedded objects / media supprimés
+  const embeddedTotal = (cleaningStats?.mediaDeleted || 0) + (cleaningStats?.picturesRemoved || 0);
+  if (embeddedTotal > 0 && riskBreakdown.embeddedObjects) {
+    const impact = Math.min(embeddedTotal * 5, riskBreakdown.embeddedObjects);
+    improvement += impact;
+    scoreImpacts.embeddedObjects = impact;
+  } else if (embeddedTotal > 0) {
+    const impact = Math.min(embeddedTotal * 5, 15);
+    improvement += impact;
+    scoreImpacts.embeddedObjects = impact;
+  }
+  
+  // Corrections orthographiques appliquées
+  if (correctionStats?.changedTextNodes > 0 && riskBreakdown.spellingGrammar) {
+    const impact = Math.min(correctionStats.changedTextNodes * 1, riskBreakdown.spellingGrammar);
+    improvement += impact;
+    scoreImpacts.spellingGrammar = impact;
+  } else if (correctionStats?.changedTextNodes > 0) {
+    const impact = Math.min(correctionStats.changedTextNodes * 1, 10);
+    improvement += impact;
+    scoreImpacts.spellingGrammar = impact;
   }
   
   // Le score après ne peut pas dépasser 100
-  return Math.min(100, beforeScore + improvement);
+  const afterScore = Math.min(100, beforeScore + improvement);
+  
+  console.log(`[AFTER SCORE] Before: ${beforeScore}, After: ${afterScore}, Improvement: +${improvement}, Impacts:`, scoreImpacts);
+  
+  return { score: afterScore, scoreImpacts, improvement };
 }
 
 // Helper: Génération des recommandations
@@ -239,7 +357,7 @@ function addReportsToZip(zip, single, base, reportParams) {
   const reportJson = buildReportData(reportParams);
   zip.addFile(outName(single, base, "report.json"), Buffer.from(JSON.stringify(reportJson, null, 2), "utf8"));
   
-  console.log(`[REPORT] Generated HTML + JSON reports for ${reportParams.filename}`);
+  console.log(`[REPORT] Generated HTML + JSON reports for ${reportParams.filename} (before: ${reportParams.beforeRiskScore}, after: ${reportParams.afterRiskScore})`);
 }
 
 // ---------- Health ----------
@@ -247,15 +365,15 @@ app.get("/health", (_, res) =>
   res.json({ 
     ok: true, 
     service: "Qualion-Doc Backend", 
-    version: "2.4",
+    version: "2.5",
     endpoints: ["/analyze", "/clean", "/rephrase"],
-    features: ["spelling-correction", "premium-json-report", "accurate-risk-score"],
+    features: ["spelling-correction", "premium-json-report", "accurate-risk-score", "score-impacts"],
     time: new Date().toISOString() 
   })
 );
 
 // ===================================================================
-// POST /analyze - VERSION 2.4 avec score corrigé
+// POST /analyze - VERSION 2.5
 // ===================================================================
 app.post("/analyze", upload.single("file"), async (req, res) => {
   const startTime = Date.now();
@@ -280,8 +398,8 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
     const detections = await analyzeDocument(req.file.buffer, fileType);
     const summary = calculateSummary(detections);
     
-    // ✅ CORRECTION: Passer les detections pour un score précis
-    const riskScore = calculateRiskScore(summary, detections);
+    // Passer les detections pour un score précis avec breakdown
+    const { score: riskScore, breakdown } = calculateRiskScore(summary, detections);
     
     const result = {
       documentId: uuidv4(),
@@ -311,6 +429,7 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
         low: summary.low,
         riskScore: riskScore,
         riskLevel: getRiskLevel(riskScore),
+        riskBreakdown: breakdown,
         recommendations: generateRecommendations(detections, summary)
       },
       processingTime: Date.now() - startTime
@@ -327,7 +446,7 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
 });
 
 // ===================================================================
-// POST /clean  → VERSION 2.4 avec score corrigé
+// POST /clean  → VERSION 2.5 avec scoreImpacts
 // ===================================================================
 app.post("/clean", upload.any(), async (req, res) => {
   try {
@@ -363,6 +482,7 @@ app.post("/clean", upload.any(), async (req, res) => {
       let analysisResult = null;
       let spellingErrors = [];
       let beforeRiskScore = 100;
+      let riskBreakdown = {};
       let detections = null;
       
       try {
@@ -370,8 +490,10 @@ app.post("/clean", upload.any(), async (req, res) => {
         detections = await analyzeDocument(f.buffer, fileType);
         const summary = calculateSummary(detections);
         
-        // ✅ CORRECTION: Passer les detections pour un score précis
-        beforeRiskScore = calculateRiskScore(summary, detections);
+        // Passer les detections pour un score précis avec breakdown
+        const riskResult = calculateRiskScore(summary, detections);
+        beforeRiskScore = riskResult.score;
+        riskBreakdown = riskResult.breakdown;
         
         spellingErrors = detections.spellingErrors || [];
         
@@ -381,6 +503,7 @@ app.post("/clean", upload.any(), async (req, res) => {
             ...summary,
             riskScore: beforeRiskScore,
             beforeRiskScore: beforeRiskScore,
+            riskBreakdown: riskBreakdown,
             riskLevel: getRiskLevel(beforeRiskScore),
             recommendations: generateRecommendations(detections, summary)
           }
@@ -412,8 +535,8 @@ app.post("/clean", upload.any(), async (req, res) => {
 
         zip.addFile(outName(single, base, "cleaned.docx"), finalBuffer);
 
-        // Calculer le score après nettoyage
-        const afterRiskScore = calculateAfterScore(beforeRiskScore, cleaned.stats, correctionStats);
+        // Calculer le score après nettoyage avec scoreImpacts
+        const afterResult = calculateAfterScore(beforeRiskScore, cleaned.stats, correctionStats, riskBreakdown);
         
         // Ajouter les deux rapports (HTML + JSON)
         addReportsToZip(zip, single, base, {
@@ -425,7 +548,8 @@ app.post("/clean", upload.any(), async (req, res) => {
           analysis: analysisResult,
           spellingErrors: spellingErrors,
           beforeRiskScore: beforeRiskScore,
-          afterRiskScore: afterRiskScore
+          afterRiskScore: afterResult.score,
+          scoreImpacts: afterResult.scoreImpacts
         });
         
       // ============================================================
@@ -449,8 +573,8 @@ app.post("/clean", upload.any(), async (req, res) => {
 
         zip.addFile(outName(single, base, "cleaned.pptx"), finalBuffer);
 
-        // Calculer le score après nettoyage
-        const afterRiskScore = calculateAfterScore(beforeRiskScore, cleaned.stats, correctionStats);
+        // Calculer le score après nettoyage avec scoreImpacts
+        const afterResult = calculateAfterScore(beforeRiskScore, cleaned.stats, correctionStats, riskBreakdown);
 
         // Ajouter les deux rapports (HTML + JSON)
         addReportsToZip(zip, single, base, {
@@ -462,7 +586,8 @@ app.post("/clean", upload.any(), async (req, res) => {
           analysis: analysisResult,
           spellingErrors: spellingErrors,
           beforeRiskScore: beforeRiskScore,
-          afterRiskScore: afterRiskScore
+          afterRiskScore: afterResult.score,
+          scoreImpacts: afterResult.scoreImpacts
         });
         
       // ============================================================
@@ -496,8 +621,8 @@ app.post("/clean", upload.any(), async (req, res) => {
           };
         }
 
-        // Calculer le score après nettoyage
-        const afterRiskScore = calculateAfterScore(beforeRiskScore, cleaned.stats, correctionStats);
+        // Calculer le score après nettoyage avec scoreImpacts
+        const afterResult = calculateAfterScore(beforeRiskScore, cleaned.stats, correctionStats, riskBreakdown);
 
         // Ajouter les deux rapports (HTML + JSON)
         addReportsToZip(zip, single, base, {
@@ -509,7 +634,8 @@ app.post("/clean", upload.any(), async (req, res) => {
           analysis: analysisResult,
           spellingErrors: spellingErrors,
           beforeRiskScore: beforeRiskScore,
-          afterRiskScore: afterRiskScore
+          afterRiskScore: afterResult.score,
+          scoreImpacts: afterResult.scoreImpacts
         });
         
       // ============================================================
@@ -518,7 +644,7 @@ app.post("/clean", upload.any(), async (req, res) => {
       } else if (ext === "xlsx") {
         zip.addFile(outName(single, base, f.originalname), f.buffer);
         
-        const afterRiskScore = calculateAfterScore(beforeRiskScore, {}, null);
+        const afterResult = calculateAfterScore(beforeRiskScore, {}, null, riskBreakdown);
         
         // Ajouter les deux rapports (HTML + JSON)
         addReportsToZip(zip, single, base, {
@@ -530,7 +656,8 @@ app.post("/clean", upload.any(), async (req, res) => {
           analysis: analysisResult,
           spellingErrors: spellingErrors,
           beforeRiskScore: beforeRiskScore,
-          afterRiskScore: afterRiskScore
+          afterRiskScore: afterResult.score,
+          scoreImpacts: afterResult.scoreImpacts
         });
         
       // ============================================================
@@ -549,7 +676,8 @@ app.post("/clean", upload.any(), async (req, res) => {
           analysis: null,
           spellingErrors: [],
           beforeRiskScore: 100,
-          afterRiskScore: 100
+          afterRiskScore: 100,
+          scoreImpacts: {}
         });
       }
     }
@@ -566,7 +694,7 @@ app.post("/clean", upload.any(), async (req, res) => {
 });
 
 // ===================================================================
-// POST /rephrase - VERSION 2.4 avec score corrigé
+// POST /rephrase - VERSION 2.5 avec scoreImpacts
 // ===================================================================
 app.post("/rephrase", upload.any(), async (req, res) => {
   try {
@@ -585,6 +713,7 @@ app.post("/rephrase", upload.any(), async (req, res) => {
       let analysisResult = null;
       let spellingErrors = [];
       let beforeRiskScore = 100;
+      let riskBreakdown = {};
       let detections = null;
       
       try {
@@ -592,8 +721,10 @@ app.post("/rephrase", upload.any(), async (req, res) => {
         detections = await analyzeDocument(f.buffer, fileType);
         const summary = calculateSummary(detections);
         
-        // ✅ CORRECTION: Passer les detections pour un score précis
-        beforeRiskScore = calculateRiskScore(summary, detections);
+        // Passer les detections pour un score précis avec breakdown
+        const riskResult = calculateRiskScore(summary, detections);
+        beforeRiskScore = riskResult.score;
+        riskBreakdown = riskResult.breakdown;
         
         spellingErrors = detections.spellingErrors || [];
         
@@ -603,6 +734,7 @@ app.post("/rephrase", upload.any(), async (req, res) => {
             ...summary,
             riskScore: beforeRiskScore,
             beforeRiskScore: beforeRiskScore,
+            riskBreakdown: riskBreakdown,
             riskLevel: getRiskLevel(beforeRiskScore),
             recommendations: generateRecommendations(detections, summary)
           }
@@ -621,7 +753,7 @@ app.post("/rephrase", upload.any(), async (req, res) => {
 
         zip.addFile(outName(single, base, "rephrased.docx"), rephrased.outBuffer);
 
-        const afterRiskScore = calculateAfterScore(beforeRiskScore, cleaned.stats, rephrased.stats);
+        const afterResult = calculateAfterScore(beforeRiskScore, cleaned.stats, rephrased.stats, riskBreakdown);
 
         // Ajouter les deux rapports (HTML + JSON)
         addReportsToZip(zip, single, base, {
@@ -633,7 +765,8 @@ app.post("/rephrase", upload.any(), async (req, res) => {
           analysis: analysisResult,
           spellingErrors: spellingErrors,
           beforeRiskScore: beforeRiskScore,
-          afterRiskScore: afterRiskScore
+          afterRiskScore: afterResult.score,
+          scoreImpacts: afterResult.scoreImpacts
         });
         
       } else if (ext === "pptx") {
@@ -646,7 +779,7 @@ app.post("/rephrase", upload.any(), async (req, res) => {
 
         zip.addFile(outName(single, base, "rephrased.pptx"), rephrased.outBuffer);
 
-        const afterRiskScore = calculateAfterScore(beforeRiskScore, cleaned.stats, rephrased.stats);
+        const afterResult = calculateAfterScore(beforeRiskScore, cleaned.stats, rephrased.stats, riskBreakdown);
 
         // Ajouter les deux rapports (HTML + JSON)
         addReportsToZip(zip, single, base, {
@@ -658,7 +791,8 @@ app.post("/rephrase", upload.any(), async (req, res) => {
           analysis: analysisResult,
           spellingErrors: spellingErrors,
           beforeRiskScore: beforeRiskScore,
-          afterRiskScore: afterRiskScore
+          afterRiskScore: afterResult.score,
+          scoreImpacts: afterResult.scoreImpacts
         });
         
       } else if (ext === "pdf") {
@@ -682,7 +816,7 @@ app.post("/rephrase", upload.any(), async (req, res) => {
 // ---------- Boot ----------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`✅ Qualion-Doc Backend v2.4 listening on port ${PORT}`);
+  console.log(`✅ Qualion-Doc Backend v2.5 listening on port ${PORT}`);
   console.log(`   Endpoints: GET /health, POST /analyze, POST /clean, POST /rephrase`);
-  console.log(`   Features: Spelling corrections, Premium JSON reports, Accurate risk scoring`);
+  console.log(`   Features: Spelling corrections, Premium JSON reports, Score impacts breakdown`);
 });
