@@ -16,6 +16,7 @@ import { buildReportHtmlDetailed, buildReportData } from "./lib/report.js";
 import { extractPdfText, filterExtractedLines } from "./lib/pdfTools.js";
 import { createDocxFromText } from "./lib/docxWriter.js";
 import { aiCorrectText } from "./lib/ai.js";
+import { cleanXLSX } from "./lib/xlsxCleaner.js"; // 👈 AJOUT
 
 // Import de documentAnalyzer
 import { analyzeDocument } from "./lib/documentAnalyzer.js";
@@ -300,7 +301,7 @@ function calculateAfterScore(beforeScore, cleaningStats, correctionStats, riskBr
 }
 
 // Helper: Génération des recommandations
-function generateRecommendations(detections, summary) {
+function generateRecommendations(detections, summary) { // summary pas utilisé pour l’instant
   const recommendations = [];
   
   if (detections.metadata?.length > 0) {
@@ -326,7 +327,7 @@ function generateRecommendations(detections, summary) {
     recommendations.push("Remove embedded objects that may contain hidden data.");
   }
   if (detections.spellingErrors?.length > 0) {
-    recommendations.push(`${detections.spellingErrors.length} spelling/grammar issue(s) were corrected.`);
+    recommendations.push(`${detections.spellingErrors.length} spelling/grammar issue(s) were detected.`);
   }
   if (recommendations.length === 0) {
     recommendations.push("Document appears clean. Minor review recommended before external sharing.");
@@ -393,10 +394,18 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
     
     const fileType = getMimeFromExt(ext);
     
-    // ✅ FIX v2.6: analyzeDocument retourne { filename, ext, fileSize, summary, detections }
+    // ✅ analyzeDocument retourne { filename, ext, fileSize, summary, detections }
     const analysisResult = await analyzeDocument(req.file.buffer, fileType);
     const detections = analysisResult.detections;
-    const summary = analysisResult.summary;
+
+    const rawSummary = analysisResult.summary;
+    const summary = {
+      totalIssues: rawSummary.totalIssues,
+      critical: rawSummary.criticalIssues,
+      high: rawSummary.highIssues,
+      medium: rawSummary.mediumIssues,
+      low: rawSummary.lowIssues,
+    };
     
     // Passer les detections pour un score précis avec breakdown
     const { score: riskScore, breakdown } = calculateRiskScore(summary, detections);
@@ -425,12 +434,8 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
         excelHiddenData: detections.excelHiddenData || []
       },
       summary: {
-        totalIssues: summary.totalIssues,
-        critical: summary.critical,
-        high: summary.high,
-        medium: summary.medium,
-        low: summary.low,
-        riskScore: riskScore,
+        ...summary,
+        riskScore,
         riskLevel: getRiskLevel(riskScore),
         riskBreakdown: breakdown,
         recommendations: generateRecommendations(detections, summary)
@@ -492,10 +497,17 @@ app.post("/clean", upload.any(), async (req, res) => {
       try {
         const fileType = getMimeFromExt(ext);
         
-        // ✅ FIX v2.6: analyzeDocument retourne { filename, ext, fileSize, summary, detections }
         const fullAnalysis = await analyzeDocument(f.buffer, fileType);
         detections = fullAnalysis.detections;
-        summary = fullAnalysis.summary;
+
+        const rawSummary = fullAnalysis.summary;
+        summary = {
+          totalIssues: rawSummary.totalIssues,
+          critical: rawSummary.criticalIssues,
+          high: rawSummary.highIssues,
+          medium: rawSummary.mediumIssues,
+          low: rawSummary.lowIssues,
+        };
         
         // Passer les detections pour un score précis avec breakdown
         const riskResult = calculateRiskScore(summary, detections);
@@ -509,8 +521,8 @@ app.post("/clean", upload.any(), async (req, res) => {
           summary: {
             ...summary,
             riskScore: beforeRiskScore,
-            beforeRiskScore: beforeRiskScore,
-            riskBreakdown: riskBreakdown,
+            beforeRiskScore,
+            riskBreakdown,
             riskLevel: getRiskLevel(beforeRiskScore),
             recommendations: generateRecommendations(detections, summary)
           }
@@ -532,7 +544,7 @@ app.post("/clean", upload.any(), async (req, res) => {
         
         if (cleaningOptions.correctSpelling) {
           const corrected = await correctDOCXText(cleaned.outBuffer, aiCorrectText, {
-            spellingErrors: spellingErrors
+            spellingErrors
           });
           finalBuffer = corrected.outBuffer;
           correctionStats = corrected.stats;
@@ -542,10 +554,8 @@ app.post("/clean", upload.any(), async (req, res) => {
 
         zip.addFile(outName(single, base, "cleaned.docx"), finalBuffer);
 
-        // Calculer le score après nettoyage avec scoreImpacts
         const afterResult = calculateAfterScore(beforeRiskScore, cleaned.stats, correctionStats, riskBreakdown);
         
-        // Ajouter les deux rapports (HTML + JSON)
         addReportsToZip(zip, single, base, {
           filename: f.originalname,
           ext,
@@ -553,8 +563,8 @@ app.post("/clean", upload.any(), async (req, res) => {
           cleaning: cleaned.stats,
           correction: correctionStats,
           analysis: analysisResult,
-          spellingErrors: spellingErrors,
-          beforeRiskScore: beforeRiskScore,
+          spellingErrors,
+          beforeRiskScore,
           afterRiskScore: afterResult.score,
           scoreImpacts: afterResult.scoreImpacts
         });
@@ -570,7 +580,7 @@ app.post("/clean", upload.any(), async (req, res) => {
         
         if (cleaningOptions.correctSpelling) {
           const corrected = await correctPPTXText(cleaned.outBuffer, aiCorrectText, {
-            spellingErrors: spellingErrors
+            spellingErrors
           });
           finalBuffer = corrected.outBuffer;
           correctionStats = corrected.stats;
@@ -580,10 +590,8 @@ app.post("/clean", upload.any(), async (req, res) => {
 
         zip.addFile(outName(single, base, "cleaned.pptx"), finalBuffer);
 
-        // Calculer le score après nettoyage avec scoreImpacts
         const afterResult = calculateAfterScore(beforeRiskScore, cleaned.stats, correctionStats, riskBreakdown);
 
-        // Ajouter les deux rapports (HTML + JSON)
         addReportsToZip(zip, single, base, {
           filename: f.originalname,
           ext,
@@ -591,8 +599,8 @@ app.post("/clean", upload.any(), async (req, res) => {
           cleaning: cleaned.stats,
           correction: correctionStats,
           analysis: analysisResult,
-          spellingErrors: spellingErrors,
-          beforeRiskScore: beforeRiskScore,
+          spellingErrors,
+          beforeRiskScore,
           afterRiskScore: afterResult.score,
           scoreImpacts: afterResult.scoreImpacts
         });
@@ -628,10 +636,8 @@ app.post("/clean", upload.any(), async (req, res) => {
           };
         }
 
-        // Calculer le score après nettoyage avec scoreImpacts
         const afterResult = calculateAfterScore(beforeRiskScore, cleaned.stats, correctionStats, riskBreakdown);
 
-        // Ajouter les deux rapports (HTML + JSON)
         addReportsToZip(zip, single, base, {
           filename: f.originalname,
           ext,
@@ -639,8 +645,8 @@ app.post("/clean", upload.any(), async (req, res) => {
           cleaning: cleaned.stats,
           correction: correctionStats,
           analysis: analysisResult,
-          spellingErrors: spellingErrors,
-          beforeRiskScore: beforeRiskScore,
+          spellingErrors,
+          beforeRiskScore,
           afterRiskScore: afterResult.score,
           scoreImpacts: afterResult.scoreImpacts
         });
@@ -649,20 +655,22 @@ app.post("/clean", upload.any(), async (req, res) => {
       // TRAITEMENT XLSX
       // ============================================================
       } else if (ext === "xlsx") {
-        zip.addFile(outName(single, base, f.originalname), f.buffer);
-        
-        const afterResult = calculateAfterScore(beforeRiskScore, {}, null, riskBreakdown);
-        
-        // Ajouter les deux rapports (HTML + JSON)
+        const cleaned = await cleanXLSX(f.buffer, cleaningOptions);
+
+        const finalBuffer = cleaned.outBuffer;
+        zip.addFile(outName(single, base, "cleaned.xlsx"), finalBuffer);
+
+        const afterResult = calculateAfterScore(beforeRiskScore, cleaned.stats, null, riskBreakdown);
+
         addReportsToZip(zip, single, base, {
           filename: f.originalname,
           ext,
           policy: cleaningOptions,
-          cleaning: {},
+          cleaning: cleaned.stats,
           correction: null,
           analysis: analysisResult,
-          spellingErrors: spellingErrors,
-          beforeRiskScore: beforeRiskScore,
+          spellingErrors,
+          beforeRiskScore,
           afterRiskScore: afterResult.score,
           scoreImpacts: afterResult.scoreImpacts
         });
@@ -673,7 +681,6 @@ app.post("/clean", upload.any(), async (req, res) => {
       } else {
         zip.addFile(outName(single, base, f.originalname), f.buffer);
         
-        // Ajouter les deux rapports (HTML + JSON)
         addReportsToZip(zip, single, base, {
           filename: f.originalname,
           ext,
@@ -727,12 +734,18 @@ app.post("/rephrase", upload.any(), async (req, res) => {
       try {
         const fileType = getMimeFromExt(ext);
         
-        // ✅ FIX v2.6: analyzeDocument retourne { filename, ext, fileSize, summary, detections }
         const fullAnalysis = await analyzeDocument(f.buffer, fileType);
         detections = fullAnalysis.detections;
-        summary = fullAnalysis.summary;
+
+        const rawSummary = fullAnalysis.summary;
+        summary = {
+          totalIssues: rawSummary.totalIssues,
+          critical: rawSummary.criticalIssues,
+          high: rawSummary.highIssues,
+          medium: rawSummary.mediumIssues,
+          low: rawSummary.lowIssues,
+        };
         
-        // Passer les detections pour un score précis avec breakdown
         const riskResult = calculateRiskScore(summary, detections);
         beforeRiskScore = riskResult.score;
         riskBreakdown = riskResult.breakdown;
@@ -744,8 +757,8 @@ app.post("/rephrase", upload.any(), async (req, res) => {
           summary: {
             ...summary,
             riskScore: beforeRiskScore,
-            beforeRiskScore: beforeRiskScore,
-            riskBreakdown: riskBreakdown,
+            beforeRiskScore,
+            riskBreakdown,
             riskLevel: getRiskLevel(beforeRiskScore),
             recommendations: generateRecommendations(detections, summary)
           }
@@ -759,14 +772,13 @@ app.post("/rephrase", upload.any(), async (req, res) => {
         
         const rephrased = await correctDOCXText(cleaned.outBuffer, aiCorrectText, {
           mode: "rephrase",
-          spellingErrors: spellingErrors
+          spellingErrors
         });
 
         zip.addFile(outName(single, base, "rephrased.docx"), rephrased.outBuffer);
 
         const afterResult = calculateAfterScore(beforeRiskScore, cleaned.stats, rephrased.stats, riskBreakdown);
 
-        // Ajouter les deux rapports (HTML + JSON)
         addReportsToZip(zip, single, base, {
           filename: f.originalname,
           ext,
@@ -774,8 +786,8 @@ app.post("/rephrase", upload.any(), async (req, res) => {
           cleaning: cleaned.stats,
           correction: rephrased.stats,
           analysis: analysisResult,
-          spellingErrors: spellingErrors,
-          beforeRiskScore: beforeRiskScore,
+          spellingErrors,
+          beforeRiskScore,
           afterRiskScore: afterResult.score,
           scoreImpacts: afterResult.scoreImpacts
         });
@@ -785,14 +797,13 @@ app.post("/rephrase", upload.any(), async (req, res) => {
         
         const rephrased = await correctPPTXText(cleaned.outBuffer, aiCorrectText, {
           mode: "rephrase",
-          spellingErrors: spellingErrors
+          spellingErrors
         });
 
         zip.addFile(outName(single, base, "rephrased.pptx"), rephrased.outBuffer);
 
         const afterResult = calculateAfterScore(beforeRiskScore, cleaned.stats, rephrased.stats, riskBreakdown);
 
-        // Ajouter les deux rapports (HTML + JSON)
         addReportsToZip(zip, single, base, {
           filename: f.originalname,
           ext,
@@ -800,8 +811,8 @@ app.post("/rephrase", upload.any(), async (req, res) => {
           cleaning: cleaned.stats,
           correction: rephrased.stats,
           analysis: analysisResult,
-          spellingErrors: spellingErrors,
-          beforeRiskScore: beforeRiskScore,
+          spellingErrors,
+          beforeRiskScore,
           afterRiskScore: afterResult.score,
           scoreImpacts: afterResult.scoreImpacts
         });
