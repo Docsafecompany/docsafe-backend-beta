@@ -1,4 +1,4 @@
-// server.js - VERSION 2.5 avec scoreImpacts pour before/after détaillé
+// server.js - VERSION 2.6 avec fix structure analyzeDocument
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -18,7 +18,7 @@ import { createDocxFromText } from "./lib/docxWriter.js";
 import { aiCorrectText } from "./lib/ai.js";
 
 // Import de documentAnalyzer
-import { analyzeDocument, calculateSummary } from "./lib/documentAnalyzer.js";
+import { analyzeDocument } from "./lib/documentAnalyzer.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -211,9 +211,6 @@ function calculateAfterScore(beforeScore, cleaningStats, correctionStats, riskBr
   let improvement = 0;
   const scoreImpacts = {};
   
-  // Récupérer les points perdus par catégorie du breakdown
-  // Et calculer combien on récupère via le nettoyage
-  
   // Metadata supprimées → récupérer jusqu'à 100% des points perdus
   if (cleaningStats?.metaRemoved > 0 && riskBreakdown.metadata) {
     const impact = Math.min(cleaningStats.metaRemoved * 2, riskBreakdown.metadata);
@@ -365,15 +362,15 @@ app.get("/health", (_, res) =>
   res.json({ 
     ok: true, 
     service: "Qualion-Doc Backend", 
-    version: "2.5",
+    version: "2.6",
     endpoints: ["/analyze", "/clean", "/rephrase"],
-    features: ["spelling-correction", "premium-json-report", "accurate-risk-score", "score-impacts"],
+    features: ["spelling-correction", "premium-json-report", "accurate-risk-score", "score-impacts", "fixed-detections"],
     time: new Date().toISOString() 
   })
 );
 
 // ===================================================================
-// POST /analyze - VERSION 2.5
+// POST /analyze - VERSION 2.6 CORRIGÉE
 // ===================================================================
 app.post("/analyze", upload.single("file"), async (req, res) => {
   const startTime = Date.now();
@@ -395,8 +392,11 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
     console.log(`[ANALYZE] Processing ${req.file.originalname} (${(req.file.size / 1024).toFixed(1)} KB)`);
     
     const fileType = getMimeFromExt(ext);
-    const detections = await analyzeDocument(req.file.buffer, fileType);
-    const summary = calculateSummary(detections);
+    
+    // ✅ FIX v2.6: analyzeDocument retourne { filename, ext, fileSize, summary, detections }
+    const analysisResult = await analyzeDocument(req.file.buffer, fileType);
+    const detections = analysisResult.detections;
+    const summary = analysisResult.summary;
     
     // Passer les detections pour un score précis avec breakdown
     const { score: riskScore, breakdown } = calculateRiskScore(summary, detections);
@@ -419,7 +419,10 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
         spellingErrors: detections.spellingErrors || [],
         brokenLinks: detections.brokenLinks || [],
         businessInconsistencies: detections.businessInconsistencies || [],
-        complianceRisks: detections.complianceRisks || []
+        complianceRisks: detections.complianceRisks || [],
+        visualObjects: detections.visualObjects || [],
+        orphanData: detections.orphanData || [],
+        excelHiddenData: detections.excelHiddenData || []
       },
       summary: {
         totalIssues: summary.totalIssues,
@@ -446,7 +449,7 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
 });
 
 // ===================================================================
-// POST /clean  → VERSION 2.5 avec scoreImpacts
+// POST /clean  → VERSION 2.6 CORRIGÉE
 // ===================================================================
 app.post("/clean", upload.any(), async (req, res) => {
   try {
@@ -484,11 +487,15 @@ app.post("/clean", upload.any(), async (req, res) => {
       let beforeRiskScore = 100;
       let riskBreakdown = {};
       let detections = null;
+      let summary = null;
       
       try {
         const fileType = getMimeFromExt(ext);
-        detections = await analyzeDocument(f.buffer, fileType);
-        const summary = calculateSummary(detections);
+        
+        // ✅ FIX v2.6: analyzeDocument retourne { filename, ext, fileSize, summary, detections }
+        const fullAnalysis = await analyzeDocument(f.buffer, fileType);
+        detections = fullAnalysis.detections;
+        summary = fullAnalysis.summary;
         
         // Passer les detections pour un score précis avec breakdown
         const riskResult = calculateRiskScore(summary, detections);
@@ -694,7 +701,7 @@ app.post("/clean", upload.any(), async (req, res) => {
 });
 
 // ===================================================================
-// POST /rephrase - VERSION 2.5 avec scoreImpacts
+// POST /rephrase - VERSION 2.6 CORRIGÉE
 // ===================================================================
 app.post("/rephrase", upload.any(), async (req, res) => {
   try {
@@ -715,11 +722,15 @@ app.post("/rephrase", upload.any(), async (req, res) => {
       let beforeRiskScore = 100;
       let riskBreakdown = {};
       let detections = null;
+      let summary = null;
       
       try {
         const fileType = getMimeFromExt(ext);
-        detections = await analyzeDocument(f.buffer, fileType);
-        const summary = calculateSummary(detections);
+        
+        // ✅ FIX v2.6: analyzeDocument retourne { filename, ext, fileSize, summary, detections }
+        const fullAnalysis = await analyzeDocument(f.buffer, fileType);
+        detections = fullAnalysis.detections;
+        summary = fullAnalysis.summary;
         
         // Passer les detections pour un score précis avec breakdown
         const riskResult = calculateRiskScore(summary, detections);
@@ -816,7 +827,7 @@ app.post("/rephrase", upload.any(), async (req, res) => {
 // ---------- Boot ----------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`✅ Qualion-Doc Backend v2.5 listening on port ${PORT}`);
+  console.log(`✅ Qualion-Doc Backend v2.6 listening on port ${PORT}`);
   console.log(`   Endpoints: GET /health, POST /analyze, POST /clean, POST /rephrase`);
-  console.log(`   Features: Spelling corrections, Premium JSON reports, Score impacts breakdown`);
+  console.log(`   Features: Spelling corrections, Premium JSON reports, Score impacts breakdown, Fixed detections structure`);
 });
