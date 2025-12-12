@@ -11,7 +11,7 @@ import { v4 as uuidv4 } from "uuid";
 import { cleanDOCX } from "./lib/docxCleaner.js";
 import { cleanPPTX } from "./lib/pptxCleaner.js";
 import { cleanPDF } from "./lib/pdfCleaner.js";
-import { correctDOCXText, correctPPTXText } from "./lib/officeCorrect.js";
+import { correctDOCXText, correctPPTXText, correctXLSXText } from "./lib/officeCorrect.js";
 import { buildReportHtmlDetailed, buildReportData } from "./lib/report.js";
 import { extractPdfText, filterExtractedLines } from "./lib/pdfTools.js";
 import { createDocxFromText } from "./lib/docxWriter.js";
@@ -586,27 +586,38 @@ app.post("/clean", upload.any(), async (req, res) => {
           afterRiskScore: afterResult.score,
           scoreImpacts: afterResult.scoreImpacts,
         });
-      } else if (ext === "xlsx") {
-        const cleaned = await cleanXLSX(f.buffer, cleaningOptions);
+     } else if (ext === "xlsx") {
+  const cleaned = await cleanXLSX(f.buffer, cleaningOptions);
 
-        // NOTE: ici on ne fait pas de correction texte pour XLSX (sauf si ton officeCorrect le gère)
-        zip.addFile(outName(single, base, "cleaned.xlsx"), cleaned.outBuffer);
+  let finalBuffer = cleaned.outBuffer;
+  let correctionStats = null;
 
-        const afterResult = calculateAfterScore(beforeRiskScore, cleaned.stats, null, riskBreakdown);
+  if (cleaningOptions.correctSpelling) {
+    const corrected = await correctXLSXText(cleaned.outBuffer, aiCorrectText, {
+      spellingErrors: spellingFixList,
+    });
+    finalBuffer = corrected.outBuffer;
+    correctionStats = corrected.stats;
+  }
 
-        addReportsToZip(zip, single, base, {
-          filename: f.originalname,
-          ext,
-          policy: cleaningOptions,
-          cleaning: cleaned.stats,
-          correction: null,
-          analysis: analysisResult,
-          spellingErrors,
-          approvedSpellingErrors,
-          beforeRiskScore,
-          afterRiskScore: afterResult.score,
-          scoreImpacts: afterResult.scoreImpacts,
-        });
+  zip.addFile(outName(single, base, "cleaned.xlsx"), finalBuffer);
+
+  const afterResult = calculateAfterScore(beforeRiskScore, cleaned.stats, correctionStats, riskBreakdown);
+
+  addReportsToZip(zip, single, base, {
+    filename: f.originalname,
+    ext,
+    policy: cleaningOptions,
+    cleaning: cleaned.stats,
+    correction: correctionStats,
+    analysis: analysisResult,
+    spellingErrors,
+    approvedSpellingErrors,
+    beforeRiskScore,
+    afterRiskScore: afterResult.score,
+    scoreImpacts: afterResult.scoreImpacts,
+  });
+}
       } else {
         zip.addFile(outName(single, base, f.originalname), f.buffer);
 
