@@ -617,7 +617,6 @@ app.post("/clean", upload.any(), async (req, res) => {
     afterRiskScore: afterResult.score,
     scoreImpacts: afterResult.scoreImpacts,
   });
-}
       } else {
         zip.addFile(outName(single, base, f.originalname), f.buffer);
 
