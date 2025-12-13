@@ -1,4 +1,4 @@
-// server.js - VERSION 2.6.1 (approvedSpellingErrors support, no new modules)
+// server.js - VERSION 2.7.0 (adds documentStats BEFORE/AFTER, no new modules)
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -11,7 +11,11 @@ import { v4 as uuidv4 } from "uuid";
 import { cleanDOCX } from "./lib/docxCleaner.js";
 import { cleanPPTX } from "./lib/pptxCleaner.js";
 import { cleanPDF } from "./lib/pdfCleaner.js";
-import { correctDOCXText, correctPPTXText, correctXLSXText } from "./lib/officeCorrect.js";
+import {
+  correctDOCXText,
+  correctPPTXText,
+  correctXLSXText,
+} from "./lib/officeCorrect.js";
 import { buildReportHtmlDetailed, buildReportData } from "./lib/report.js";
 import { extractPdfText, filterExtractedLines } from "./lib/pdfTools.js";
 import { createDocxFromText } from "./lib/docxWriter.js";
@@ -20,6 +24,9 @@ import { cleanXLSX } from "./lib/xlsxCleaner.js";
 
 // Import de documentAnalyzer
 import { analyzeDocument } from "./lib/documentAnalyzer.js";
+
+// 🆕 Import docStats (YOU MUST create ./lib/docStats.js)
+import { extractDocStats } from "./lib/docStats.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -48,7 +55,9 @@ const upload = multer({
 });
 
 // ---------- Helpers ----------
-const getExt = (fn = "") => (fn.includes(".") ? fn.split(".").pop().toLowerCase() : "");
+const getExt = (fn = "") =>
+  fn.includes(".") ? fn.split(".").pop().toLowerCase() : "";
+
 const getMimeFromExt = (ext) => {
   const map = {
     docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -58,6 +67,7 @@ const getMimeFromExt = (ext) => {
   };
   return map[ext] || "application/octet-stream";
 };
+
 const outName = (single, base, name) => (single ? name : `${base}_${name}`);
 const baseName = (filename = "document") => filename.replace(/\.[^.]+$/, "");
 
@@ -65,6 +75,24 @@ function sendZip(res, zip, zipName) {
   res.setHeader("Content-Type", "application/zip");
   res.setHeader("Content-Disposition", `attachment; filename="${zipName}"`);
   res.send(zip.toBuffer());
+}
+
+// 🆕 Safe wrapper for doc stats (never breaks pipeline)
+async function safeExtractDocStats(buffer, ext) {
+  try {
+    const stats = await extractDocStats(buffer, ext);
+    return (
+      stats || {
+        pages: null,
+        slides: null,
+        sheets: null,
+        tables: null,
+      }
+    );
+  } catch (e) {
+    console.warn("[DOC STATS] Failed:", e?.message || e);
+    return { pages: null, slides: null, sheets: null, tables: null };
+  }
 }
 
 // ============================================================
@@ -111,7 +139,8 @@ function calculateRiskScore(summary, detections = null) {
     }
 
     const hiddenCount =
-      (detections.hiddenContent?.length || 0) + (detections.hiddenSheets?.length || 0);
+      (detections.hiddenContent?.length || 0) +
+      (detections.hiddenSheets?.length || 0);
     if (hiddenCount > 0) {
       const penalty = Math.min(hiddenCount * 8, 24);
       score -= penalty;
@@ -172,7 +201,10 @@ function calculateRiskScore(summary, detections = null) {
       (summary.high || 0) +
       (summary.medium || 0) +
       (summary.low || 0);
-    const unclassifiedIssues = Math.max(0, (summary.totalIssues || 0) - classifiedIssues);
+    const unclassifiedIssues = Math.max(
+      0,
+      (summary.totalIssues || 0) - classifiedIssues
+    );
 
     if (unclassifiedIssues > 0) {
       const penalty = unclassifiedIssues * 5;
@@ -188,7 +220,10 @@ function calculateRiskScore(summary, detections = null) {
   }
 
   const finalScore = Math.max(0, Math.min(100, score));
-  console.log(`[RISK SCORE] Calculated: ${finalScore} (total issues: ${summary.totalIssues})`, breakdown);
+  console.log(
+    `[RISK SCORE] Calculated: ${finalScore} (total issues: ${summary.totalIssues})`,
+    breakdown
+  );
   return { score: finalScore, breakdown };
 }
 
@@ -280,18 +315,40 @@ function calculateAfterScore(beforeScore, cleaningStats, correctionStats, riskBr
 
 function generateRecommendations(detections) {
   const recommendations = [];
-  if (detections.metadata?.length > 0) recommendations.push("Remove document metadata to protect author and organization information.");
-  if (detections.comments?.length > 0) recommendations.push(`Review and remove ${detections.comments.length} comment(s) before sharing externally.`);
-  if (detections.trackChanges?.length > 0) recommendations.push("Accept or reject all tracked changes to finalize the document.");
-  if (detections.hiddenContent?.length > 0 || detections.hiddenSheets?.length > 0) recommendations.push("Remove hidden content that could expose confidential information.");
-  if (detections.macros?.length > 0) recommendations.push("Remove macros for security - they can contain executable code.");
+  if (detections.metadata?.length > 0)
+    recommendations.push(
+      "Remove document metadata to protect author and organization information."
+    );
+  if (detections.comments?.length > 0)
+    recommendations.push(
+      `Review and remove ${detections.comments.length} comment(s) before sharing externally.`
+    );
+  if (detections.trackChanges?.length > 0)
+    recommendations.push(
+      "Accept or reject all tracked changes to finalize the document."
+    );
+  if (detections.hiddenContent?.length > 0 || detections.hiddenSheets?.length > 0)
+    recommendations.push(
+      "Remove hidden content that could expose confidential information."
+    );
+  if (detections.macros?.length > 0)
+    recommendations.push(
+      "Remove macros for security - they can contain executable code."
+    );
   if (detections.sensitiveData?.length > 0) {
     const types = [...new Set(detections.sensitiveData.map((d) => d.type))];
     recommendations.push(`Review sensitive data detected: ${types.join(", ")}.`);
   }
-  if (detections.embeddedObjects?.length > 0) recommendations.push("Remove embedded objects that may contain hidden data.");
-  if (detections.spellingErrors?.length > 0) recommendations.push(`${detections.spellingErrors.length} spelling/grammar issue(s) were detected.`);
-  if (recommendations.length === 0) recommendations.push("Document appears clean. Minor review recommended before external sharing.");
+  if (detections.embeddedObjects?.length > 0)
+    recommendations.push("Remove embedded objects that may contain hidden data.");
+  if (detections.spellingErrors?.length > 0)
+    recommendations.push(
+      `${detections.spellingErrors.length} spelling/grammar issue(s) were detected.`
+    );
+  if (recommendations.length === 0)
+    recommendations.push(
+      "Document appears clean. Minor review recommended before external sharing."
+    );
   return recommendations;
 }
 
@@ -308,7 +365,10 @@ function addReportsToZip(zip, single, base, reportParams) {
   zip.addFile(outName(single, base, "report.html"), Buffer.from(reportHtml, "utf8"));
 
   const reportJson = buildReportData(reportParams);
-  zip.addFile(outName(single, base, "report.json"), Buffer.from(JSON.stringify(reportJson, null, 2), "utf8"));
+  zip.addFile(
+    outName(single, base, "report.json"),
+    Buffer.from(JSON.stringify(reportJson, null, 2), "utf8")
+  );
 }
 
 // ---------- Health ----------
@@ -316,15 +376,22 @@ app.get("/health", (_, res) =>
   res.json({
     ok: true,
     service: "Qualion-Doc Backend",
-    version: "2.6.1",
+    version: "2.7.0",
     endpoints: ["/analyze", "/clean", "/rephrase"],
-    features: ["approvedSpellingErrors", "premium-json-report", "accurate-risk-score", "score-impacts", "fixed-detections"],
+    features: [
+      "approvedSpellingErrors",
+      "premium-json-report",
+      "accurate-risk-score",
+      "score-impacts",
+      "fixed-detections",
+      "documentStats-before-after",
+    ],
     time: new Date().toISOString(),
   })
 );
 
 // ===================================================================
-// POST /analyze - VERSION 2.6 CORRIGÉE
+// POST /analyze - VERSION 2.7.0 (adds documentStats)
 // ===================================================================
 app.post("/analyze", upload.single("file"), async (req, res) => {
   const startTime = Date.now();
@@ -335,10 +402,16 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
     const ext = getExt(req.file.originalname);
     const supportedExts = ["docx", "pptx", "xlsx", "pdf"];
     if (!supportedExts.includes(ext)) {
-      return res.status(400).json({ error: `Unsupported file type: .${ext}. Supported: ${supportedExts.join(", ")}` });
+      return res.status(400).json({
+        error: `Unsupported file type: .${ext}. Supported: ${supportedExts.join(", ")}`,
+      });
     }
 
-    console.log(`[ANALYZE] Processing ${req.file.originalname} (${(req.file.size / 1024).toFixed(1)} KB)`);
+    console.log(
+      `[ANALYZE] Processing ${req.file.originalname} (${(
+        req.file.size / 1024
+      ).toFixed(1)} KB)`
+    );
 
     const fileType = getMimeFromExt(ext);
     const analysisResult = await analyzeDocument(req.file.buffer, fileType);
@@ -355,11 +428,18 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
 
     const { score: riskScore, breakdown } = calculateRiskScore(summary, detections);
 
+    // 🆕 documentStats
+    const documentStats = await safeExtractDocStats(req.file.buffer, ext);
+
     res.json({
       documentId: uuidv4(),
       fileName: req.file.originalname,
       fileType: ext,
       fileSize: req.file.size,
+
+      // 🆕 Fact-based structural overview
+      documentStats,
+
       detections: {
         metadata: detections.metadata || [],
         comments: detections.comments || [],
@@ -378,6 +458,7 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
         orphanData: detections.orphanData || [],
         excelHiddenData: detections.excelHiddenData || [],
       },
+
       summary: {
         ...summary,
         riskScore,
@@ -385,6 +466,7 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
         riskBreakdown: breakdown,
         recommendations: generateRecommendations(detections),
       },
+
       processingTime: Date.now() - startTime,
     });
   } catch (e) {
@@ -394,7 +476,7 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
 });
 
 // ===================================================================
-// POST /clean  → VERSION 2.6.1 (uses approvedSpellingErrors if provided)
+// POST /clean  → VERSION 2.7.0 (adds before/after documentStats in report)
 // ===================================================================
 app.post("/clean", upload.any(), async (req, res) => {
   try {
@@ -435,6 +517,9 @@ app.post("/clean", upload.any(), async (req, res) => {
 
       console.log(`[CLEAN] Processing ${f.originalname} with options:`, cleaningOptions);
 
+      // 🆕 BEFORE structural stats (always attempt)
+      const documentStatsBefore = await safeExtractDocStats(f.buffer, ext);
+
       let analysisResult = null;
       let spellingErrors = [];
       let beforeRiskScore = 100;
@@ -464,6 +549,7 @@ app.post("/clean", upload.any(), async (req, res) => {
 
         analysisResult = {
           detections,
+          documentStats: documentStatsBefore, // 🆕 helpful for frontend too if needed
           summary: {
             ...summary,
             riskScore: beforeRiskScore,
@@ -497,6 +583,9 @@ app.post("/clean", upload.any(), async (req, res) => {
           correctionStats = corrected.stats;
         }
 
+        // 🆕 AFTER structural stats (after cleaning/correction)
+        const documentStatsAfter = await safeExtractDocStats(finalBuffer, ext);
+
         zip.addFile(outName(single, base, "cleaned.docx"), finalBuffer);
 
         const afterResult = calculateAfterScore(beforeRiskScore, cleaned.stats, correctionStats, riskBreakdown);
@@ -513,6 +602,10 @@ app.post("/clean", upload.any(), async (req, res) => {
           beforeRiskScore,
           afterRiskScore: afterResult.score,
           scoreImpacts: afterResult.scoreImpacts,
+
+          // 🆕 stats
+          documentStatsBefore,
+          documentStatsAfter,
         });
       } else if (ext === "pptx") {
         const cleaned = await cleanPPTX(f.buffer, { drawPolicy, ...cleaningOptions });
@@ -527,6 +620,9 @@ app.post("/clean", upload.any(), async (req, res) => {
           finalBuffer = corrected.outBuffer;
           correctionStats = corrected.stats;
         }
+
+        // 🆕 AFTER structural stats
+        const documentStatsAfter = await safeExtractDocStats(finalBuffer, ext);
 
         zip.addFile(outName(single, base, "cleaned.pptx"), finalBuffer);
 
@@ -544,6 +640,10 @@ app.post("/clean", upload.any(), async (req, res) => {
           beforeRiskScore,
           afterRiskScore: afterResult.score,
           scoreImpacts: afterResult.scoreImpacts,
+
+          // 🆕 stats
+          documentStatsBefore,
+          documentStatsAfter,
         });
       } else if (ext === "pdf") {
         const cleaned = await cleanPDF(f.buffer, {
@@ -551,7 +651,10 @@ app.post("/clean", upload.any(), async (req, res) => {
           extractTextFn: async (b) => filterExtractedLines(await extractPdfText(b), { strictPdf: true }),
         });
 
-        zip.addFile(outName(single, base, pdfMode === "text-only" ? "text_only.pdf" : "sanitized.pdf"), cleaned.outBuffer);
+        zip.addFile(
+          outName(single, base, pdfMode === "text-only" ? "text_only.pdf" : "sanitized.pdf"),
+          cleaned.outBuffer
+        );
 
         let correctionStats = null;
         if (includePdfDocx) {
@@ -563,13 +666,17 @@ app.post("/clean", upload.any(), async (req, res) => {
 
           correctionStats = {
             totalTextNodes: 0,
-            changedTextNodes: correctedTxt && filtered ? (correctedTxt.trim() === filtered.trim() ? 0 : 1) : 0,
+            changedTextNodes:
+              correctedTxt && filtered ? (correctedTxt.trim() === filtered.trim() ? 0 : 1) : 0,
             examples:
               correctedTxt && filtered && correctedTxt.trim() !== filtered.trim()
                 ? [{ before: filtered.slice(0, 140), after: correctedTxt.slice(0, 140) }]
                 : [],
           };
         }
+
+        // 🆕 AFTER structural stats
+        const documentStatsAfter = await safeExtractDocStats(cleaned.outBuffer, ext);
 
         const afterResult = calculateAfterScore(beforeRiskScore, cleaned.stats, correctionStats, riskBreakdown);
 
@@ -585,38 +692,49 @@ app.post("/clean", upload.any(), async (req, res) => {
           beforeRiskScore,
           afterRiskScore: afterResult.score,
           scoreImpacts: afterResult.scoreImpacts,
+
+          // 🆕 stats
+          documentStatsBefore,
+          documentStatsAfter,
         });
-     } else if (ext === "xlsx") {
-  const cleaned = await cleanXLSX(f.buffer, cleaningOptions);
+      } else if (ext === "xlsx") {
+        const cleaned = await cleanXLSX(f.buffer, cleaningOptions);
 
-  let finalBuffer = cleaned.outBuffer;
-  let correctionStats = null;
+        let finalBuffer = cleaned.outBuffer;
+        let correctionStats = null;
 
-  if (cleaningOptions.correctSpelling) {
-    const corrected = await correctXLSXText(cleaned.outBuffer, aiCorrectText, {
-      spellingErrors: spellingFixList,
-    });
-    finalBuffer = corrected.outBuffer;
-    correctionStats = corrected.stats;
-  }
+        if (cleaningOptions.correctSpelling) {
+          const corrected = await correctXLSXText(cleaned.outBuffer, aiCorrectText, {
+            spellingErrors: spellingFixList,
+          });
+          finalBuffer = corrected.outBuffer;
+          correctionStats = corrected.stats;
+        }
 
-  zip.addFile(outName(single, base, "cleaned.xlsx"), finalBuffer);
+        // 🆕 AFTER structural stats
+        const documentStatsAfter = await safeExtractDocStats(finalBuffer, ext);
 
-  const afterResult = calculateAfterScore(beforeRiskScore, cleaned.stats, correctionStats, riskBreakdown);
+        zip.addFile(outName(single, base, "cleaned.xlsx"), finalBuffer);
 
-  addReportsToZip(zip, single, base, {
-    filename: f.originalname,
-    ext,
-    policy: cleaningOptions,
-    cleaning: cleaned.stats,
-    correction: correctionStats,
-    analysis: analysisResult,
-    spellingErrors,
-    approvedSpellingErrors,
-    beforeRiskScore,
-    afterRiskScore: afterResult.score,
-    scoreImpacts: afterResult.scoreImpacts,
-  });
+        const afterResult = calculateAfterScore(beforeRiskScore, cleaned.stats, correctionStats, riskBreakdown);
+
+        addReportsToZip(zip, single, base, {
+          filename: f.originalname,
+          ext,
+          policy: cleaningOptions,
+          cleaning: cleaned.stats,
+          correction: correctionStats,
+          analysis: analysisResult,
+          spellingErrors,
+          approvedSpellingErrors,
+          beforeRiskScore,
+          afterRiskScore: afterResult.score,
+          scoreImpacts: afterResult.scoreImpacts,
+
+          // 🆕 stats
+          documentStatsBefore,
+          documentStatsAfter,
+        });
       } else {
         zip.addFile(outName(single, base, f.originalname), f.buffer);
 
@@ -632,12 +750,18 @@ app.post("/clean", upload.any(), async (req, res) => {
           beforeRiskScore: 100,
           afterRiskScore: 100,
           scoreImpacts: {},
+
+          // 🆕 stats
+          documentStatsBefore,
+          documentStatsAfter: documentStatsBefore,
         });
       }
     }
 
     const zipName =
-      files.length === 1 ? `${baseName(files[0].originalname)} cleaned.zip` : "qualion_doc_cleaned.zip";
+      files.length === 1
+        ? `${baseName(files[0].originalname)} cleaned.zip`
+        : "qualion_doc_cleaned.zip";
 
     sendZip(res, zip, zipName);
   } catch (e) {
@@ -647,7 +771,7 @@ app.post("/clean", upload.any(), async (req, res) => {
 });
 
 // ===================================================================
-// POST /rephrase - VERSION 2.6 CORRIGÉE
+// POST /rephrase - VERSION 2.7.0 (adds before/after documentStats in report)
 // ===================================================================
 app.post("/rephrase", upload.any(), async (req, res) => {
   try {
@@ -662,6 +786,9 @@ app.post("/rephrase", upload.any(), async (req, res) => {
       const ext = getExt(f.originalname);
       const base = path.parse(f.originalname).name;
 
+      // 🆕 BEFORE structural stats
+      const documentStatsBefore = await safeExtractDocStats(f.buffer, ext);
+
       let analysisResult = null;
       let spellingErrors = [];
       let beforeRiskScore = 100;
@@ -671,7 +798,6 @@ app.post("/rephrase", upload.any(), async (req, res) => {
 
       try {
         const fileType = getMimeFromExt(ext);
-
         const fullAnalysis = await analyzeDocument(f.buffer, fileType);
         detections = fullAnalysis.detections;
 
@@ -692,6 +818,7 @@ app.post("/rephrase", upload.any(), async (req, res) => {
 
         analysisResult = {
           detections,
+          documentStats: documentStatsBefore,
           summary: {
             ...summary,
             riskScore: beforeRiskScore,
@@ -713,6 +840,9 @@ app.post("/rephrase", upload.any(), async (req, res) => {
           spellingErrors,
         });
 
+        // 🆕 AFTER structural stats
+        const documentStatsAfter = await safeExtractDocStats(rephrased.outBuffer, ext);
+
         zip.addFile(outName(single, base, "rephrased.docx"), rephrased.outBuffer);
 
         const afterResult = calculateAfterScore(beforeRiskScore, cleaned.stats, rephrased.stats, riskBreakdown);
@@ -728,6 +858,10 @@ app.post("/rephrase", upload.any(), async (req, res) => {
           beforeRiskScore,
           afterRiskScore: afterResult.score,
           scoreImpacts: afterResult.scoreImpacts,
+
+          // 🆕 stats
+          documentStatsBefore,
+          documentStatsAfter,
         });
       } else if (ext === "pptx") {
         const cleaned = await cleanPPTX(f.buffer, { drawPolicy });
@@ -736,6 +870,9 @@ app.post("/rephrase", upload.any(), async (req, res) => {
           mode: "rephrase",
           spellingErrors,
         });
+
+        // 🆕 AFTER structural stats
+        const documentStatsAfter = await safeExtractDocStats(rephrased.outBuffer, ext);
 
         zip.addFile(outName(single, base, "rephrased.pptx"), rephrased.outBuffer);
 
@@ -752,16 +889,24 @@ app.post("/rephrase", upload.any(), async (req, res) => {
           beforeRiskScore,
           afterRiskScore: afterResult.score,
           scoreImpacts: afterResult.scoreImpacts,
+
+          // 🆕 stats
+          documentStatsBefore,
+          documentStatsAfter,
         });
       } else if (ext === "pdf") {
-        return res.status(400).json({ error: "Rephrase for PDF is disabled. Convert to DOCX/PPTX first." });
+        return res.status(400).json({
+          error: "Rephrase for PDF is disabled. Convert to DOCX/PPTX first.",
+        });
       } else {
         return res.status(400).json({ error: `Unsupported file for rephrase: .${ext}` });
       }
     }
 
     const zipName =
-      files.length === 1 ? `${baseName(files[0].originalname)} rephrased.zip` : "qualion_doc_rephrased.zip";
+      files.length === 1
+        ? `${baseName(files[0].originalname)} rephrased.zip`
+        : "qualion_doc_rephrased.zip";
 
     sendZip(res, zip, zipName);
   } catch (e) {
@@ -773,6 +918,6 @@ app.post("/rephrase", upload.any(), async (req, res) => {
 // ---------- Boot ----------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`✅ Qualion-Doc Backend v2.6.1 listening on port ${PORT}`);
+  console.log(`✅ Qualion-Doc Backend v2.7.0 listening on port ${PORT}`);
   console.log(`   Endpoints: GET /health, POST /analyze, POST /clean, POST /rephrase`);
 });
