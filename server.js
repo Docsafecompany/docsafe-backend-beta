@@ -252,7 +252,13 @@ function calculateRiskScore(summary, detections = null) {
 // ============================================================
 // Calcul du score APRÈS nettoyage
 // ============================================================
-function calculateAfterScore(beforeScore, cleaningStats, correctionStats, riskBreakdown = {}, extraRemovals = {}) {
+function calculateAfterScore(
+  beforeScore,
+  cleaningStats,
+  correctionStats,
+  riskBreakdown = {},
+  extraRemovals = {}
+) {
   let improvement = 0;
   const scoreImpacts = {};
 
@@ -524,62 +530,54 @@ app.post("/clean", upload.any(), async (req, res) => {
     const pdfMode = (req.body.pdfMode || "sanitize").toLowerCase();
     const includePdfDocx = String(req.body.pdfDocx || "false") === "true";
 
-const cleaningOptions = {
-  removeMetadata: req.body.removeMetadata !== "false",
-  removeComments: req.body.removeComments !== "false",
-  acceptTrackChanges: req.body.acceptTrackChanges !== "false",
-  removeHiddenContent: req.body.removeHiddenContent !== "false",
-  removeEmbeddedObjects: req.body.removeEmbeddedObjects !== "false",
-  removeMacros: req.body.removeMacros !== "false",
-  correctSpelling: req.body.correctSpelling !== "false",
-};
+    const cleaningOptions = {
+      removeMetadata: req.body.removeMetadata !== "false",
+      removeComments: req.body.removeComments !== "false",
+      acceptTrackChanges: req.body.acceptTrackChanges !== "false",
+      removeHiddenContent: req.body.removeHiddenContent !== "false",
+      removeEmbeddedObjects: req.body.removeEmbeddedObjects !== "false",
+      removeMacros: req.body.removeMacros !== "false",
+      correctSpelling: req.body.correctSpelling !== "false",
+    };
 
-// ✅ Parse approved spelling errors
-const approvedSpellingErrors = safeJsonParse(req.body.approvedSpellingErrors, []);
+    // ✅ Parse approved spelling errors
+    const approvedSpellingErrors = safeJsonParse(req.body.approvedSpellingErrors, []);
 
-// ✅ Accept BOTH payload shapes from frontend (old + new)
-// Old: removeSensitiveData / hiddenContentToClean / visualObjectsToClean
-// New: sensitiveDataToClean / hiddenContentToClean / visualObjectsToClean
-const removeSensitiveDataRaw =
-  safeJsonParse(req.body.removeSensitiveData, null) ??
-  safeJsonParse(req.body.sensitiveDataToClean, []);
+    // ✅ Accept BOTH payload shapes from frontend (old + new)
+    const removeSensitiveDataRaw =
+      safeJsonParse(req.body.removeSensitiveData, null) ??
+      safeJsonParse(req.body.sensitiveDataToClean, []);
 
-const hiddenContentToCleanRaw =
-  safeJsonParse(req.body.hiddenContentToClean, []);
+    const hiddenContentToCleanRaw = safeJsonParse(req.body.hiddenContentToClean, []);
+    const visualObjectsToCleanRaw = safeJsonParse(req.body.visualObjectsToClean, []);
 
-const visualObjectsToCleanRaw =
-  safeJsonParse(req.body.visualObjectsToClean, []);
-
-// Optional debug: if full objects, log the values
-try {
-  if (Array.isArray(removeSensitiveDataRaw) && removeSensitiveDataRaw.length > 0) {
-    const first = removeSensitiveDataRaw[0];
-    if (typeof first === "object" && first?.value) {
-      console.log(
-        "[CLEAN] sensitiveData values:",
-        removeSensitiveDataRaw.map(s => s?.value).filter(Boolean)
-      );
+    // Optional debug: if full objects, log the values
+    try {
+      if (Array.isArray(removeSensitiveDataRaw) && removeSensitiveDataRaw.length > 0) {
+        const first = removeSensitiveDataRaw[0];
+        if (typeof first === "object" && first?.value) {
+          console.log(
+            "[CLEAN] sensitiveData values:",
+            removeSensitiveDataRaw.map((s) => s?.value).filter(Boolean)
+          );
+        }
+      }
+    } catch (e) {
+      console.warn("[CLEAN] sensitiveData log error:", e?.message || e);
     }
-  }
-} catch (e) {
-  console.warn("[CLEAN] sensitiveData log error:", e?.message || e);
-}
 
-console.log(`[CLEAN] removeSensitiveData: ${removeSensitiveDataRaw?.length || 0} items`);
-console.log(`[CLEAN] hiddenContentToClean: ${hiddenContentToCleanRaw.length} items`);
-console.log(`[CLEAN] visualObjectsToClean: ${visualObjectsToCleanRaw.length} items`);
+    console.log(`[CLEAN] removeSensitiveData: ${removeSensitiveDataRaw?.length || 0} items`);
+    console.log(`[CLEAN] hiddenContentToClean: ${hiddenContentToCleanRaw.length} items`);
+    console.log(`[CLEAN] visualObjectsToClean: ${visualObjectsToCleanRaw.length} items`);
 
-const single = files.length === 1;
-const zip = new AdmZip();
+    const single = files.length === 1;
+    const zip = new AdmZip();
 
-for (const f of files) {
-  const ext = getExt(f.originalname);
-  const base = path.parse(f.originalname).name;
+    for (const f of files) {
+      const ext = getExt(f.originalname);
+      const base = path.parse(f.originalname).name;
 
-  console.log(`[CLEAN] Processing ${f.originalname} with options:`, cleaningOptions);
-  // ...
-}
-
+      console.log(`[CLEAN] Processing ${f.originalname} with options:`, cleaningOptions);
 
       // BEFORE structural stats
       const documentStatsBefore = await safeExtractDocStats(f.buffer, ext);
@@ -624,26 +622,24 @@ for (const f of files) {
           },
         };
       } catch (analysisError) {
-        console.warn(`[CLEAN] Analysis failed, continuing without:`, analysisError.message);
+        console.warn(`[CLEAN] Analysis failed, continuing without:`, analysisError?.message || analysisError);
       }
 
       // 🆕 Map IDs to full detection objects for sensitive data
       let sensitiveDataToRemove = [];
-      if (removeSensitiveDataRaw.length > 0 && detections?.sensitiveData) {
-        // If raw contains IDs (strings), find matching detections
+      if (removeSensitiveDataRaw?.length > 0 && detections?.sensitiveData) {
         if (typeof removeSensitiveDataRaw[0] === "string") {
           sensitiveDataToRemove = detections.sensitiveData.filter((d) =>
             removeSensitiveDataRaw.includes(d.id)
           );
         } else {
-          // Already full objects
           sensitiveDataToRemove = removeSensitiveDataRaw;
         }
       }
 
       // 🆕 Map IDs to full detection objects for hidden content
       let hiddenContentToRemove = [];
-      if (hiddenContentToCleanRaw.length > 0 && detections?.hiddenContent) {
+      if (hiddenContentToCleanRaw?.length > 0 && detections?.hiddenContent) {
         if (typeof hiddenContentToCleanRaw[0] === "string") {
           hiddenContentToRemove = detections.hiddenContent.filter((d) =>
             hiddenContentToCleanRaw.includes(d.id)
@@ -655,7 +651,7 @@ for (const f of files) {
 
       // 🆕 Map IDs for visual objects
       let visualObjectsToRemove = [];
-      if (visualObjectsToCleanRaw.length > 0 && detections?.visualObjects) {
+      if (visualObjectsToCleanRaw?.length > 0 && detections?.visualObjects) {
         if (typeof visualObjectsToCleanRaw[0] === "string") {
           visualObjectsToRemove = detections.visualObjects.filter((d) =>
             visualObjectsToCleanRaw.includes(d.id)
@@ -665,7 +661,9 @@ for (const f of files) {
         }
       }
 
-      console.log(`[CLEAN] Will remove: ${sensitiveDataToRemove.length} sensitive, ${hiddenContentToRemove.length} hidden, ${visualObjectsToRemove.length} visual`);
+      console.log(
+        `[CLEAN] Will remove: ${sensitiveDataToRemove.length} sensitive, ${hiddenContentToRemove.length} hidden, ${visualObjectsToRemove.length} visual`
+      );
 
       // If approvedSpellingErrors is provided and not empty, use it
       const spellingFixList =
@@ -796,7 +794,8 @@ for (const f of files) {
       } else if (ext === "pdf") {
         const cleaned = await cleanPDF(f.buffer, {
           pdfMode: pdfMode === "text-only" ? "text-only" : "sanitize",
-          extractTextFn: async (b) => filterExtractedLines(await extractPdfText(b), { strictPdf: true }),
+          extractTextFn: async (b) =>
+            filterExtractedLines(await extractPdfText(b), { strictPdf: true }),
         });
 
         zip.addFile(
@@ -980,7 +979,7 @@ app.post("/rephrase", upload.any(), async (req, res) => {
           },
         };
       } catch (analysisError) {
-        console.warn(`[REPHRASE] Analysis failed:`, analysisError.message);
+        console.warn(`[REPHRASE] Analysis failed:`, analysisError?.message || analysisError);
       }
 
       if (ext === "docx") {
