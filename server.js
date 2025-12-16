@@ -524,40 +524,62 @@ app.post("/clean", upload.any(), async (req, res) => {
     const pdfMode = (req.body.pdfMode || "sanitize").toLowerCase();
     const includePdfDocx = String(req.body.pdfDocx || "false") === "true";
 
-    const cleaningOptions = {
-      removeMetadata: req.body.removeMetadata !== "false",
-      removeComments: req.body.removeComments !== "false",
-      acceptTrackChanges: req.body.acceptTrackChanges !== "false",
-      removeHiddenContent: req.body.removeHiddenContent !== "false",
-      removeEmbeddedObjects: req.body.removeEmbeddedObjects !== "false",
-      removeMacros: req.body.removeMacros !== "false",
-      correctSpelling: req.body.correctSpelling !== "false",
-    };
+const cleaningOptions = {
+  removeMetadata: req.body.removeMetadata !== "false",
+  removeComments: req.body.removeComments !== "false",
+  acceptTrackChanges: req.body.acceptTrackChanges !== "false",
+  removeHiddenContent: req.body.removeHiddenContent !== "false",
+  removeEmbeddedObjects: req.body.removeEmbeddedObjects !== "false",
+  removeMacros: req.body.removeMacros !== "false",
+  correctSpelling: req.body.correctSpelling !== "false",
+};
 
-    // ✅ Parse approved spelling errors
-    const approvedSpellingErrors = safeJsonParse(req.body.approvedSpellingErrors, []);
+// ✅ Parse approved spelling errors
+const approvedSpellingErrors = safeJsonParse(req.body.approvedSpellingErrors, []);
 
-    // 🆕 Parse sensitive data to remove (array of IDs or full objects)
-    const removeSensitiveDataRaw = safeJsonParse(req.body.removeSensitiveData, []);
+// ✅ Accept BOTH payload shapes from frontend (old + new)
+// Old: removeSensitiveData / hiddenContentToClean / visualObjectsToClean
+// New: sensitiveDataToClean / hiddenContentToClean / visualObjectsToClean
+const removeSensitiveDataRaw =
+  safeJsonParse(req.body.removeSensitiveData, null) ??
+  safeJsonParse(req.body.sensitiveDataToClean, []);
 
-    // 🆕 Parse hidden content to remove
-    const hiddenContentToCleanRaw = safeJsonParse(req.body.hiddenContentToClean, []);
+const hiddenContentToCleanRaw =
+  safeJsonParse(req.body.hiddenContentToClean, []);
 
-    // 🆕 Parse visual objects to remove
-    const visualObjectsToCleanRaw = safeJsonParse(req.body.visualObjectsToClean, []);
+const visualObjectsToCleanRaw =
+  safeJsonParse(req.body.visualObjectsToClean, []);
 
-    console.log(`[CLEAN] removeSensitiveData: ${removeSensitiveDataRaw.length} items`);
-    console.log(`[CLEAN] hiddenContentToClean: ${hiddenContentToCleanRaw.length} items`);
-    console.log(`[CLEAN] visualObjectsToClean: ${visualObjectsToCleanRaw.length} items`);
+// Optional debug: if full objects, log the values
+try {
+  if (Array.isArray(removeSensitiveDataRaw) && removeSensitiveDataRaw.length > 0) {
+    const first = removeSensitiveDataRaw[0];
+    if (typeof first === "object" && first?.value) {
+      console.log(
+        "[CLEAN] sensitiveData values:",
+        removeSensitiveDataRaw.map(s => s?.value).filter(Boolean)
+      );
+    }
+  }
+} catch (e) {
+  console.warn("[CLEAN] sensitiveData log error:", e?.message || e);
+}
 
-    const single = files.length === 1;
-    const zip = new AdmZip();
+console.log(`[CLEAN] removeSensitiveData: ${removeSensitiveDataRaw?.length || 0} items`);
+console.log(`[CLEAN] hiddenContentToClean: ${hiddenContentToCleanRaw.length} items`);
+console.log(`[CLEAN] visualObjectsToClean: ${visualObjectsToCleanRaw.length} items`);
 
-    for (const f of files) {
-      const ext = getExt(f.originalname);
-      const base = path.parse(f.originalname).name;
+const single = files.length === 1;
+const zip = new AdmZip();
 
-      console.log(`[CLEAN] Processing ${f.originalname} with options:`, cleaningOptions);
+for (const f of files) {
+  const ext = getExt(f.originalname);
+  const base = path.parse(f.originalname).name;
+
+  console.log(`[CLEAN] Processing ${f.originalname} with options:`, cleaningOptions);
+  // ...
+}
+
 
       // BEFORE structural stats
       const documentStatsBefore = await safeExtractDocStats(f.buffer, ext);
