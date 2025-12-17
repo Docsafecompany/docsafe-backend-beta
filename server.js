@@ -1,7 +1,6 @@
-// server.js - VERSION 2.9.0
-// ✅ Fix Render crash (brace structure)
-// ✅ docStats signature fixed (extractDocStats({ ext, buffer }))
-// ✅ Select Items to Clean => REAL removal (selected only when provided)
+// server.js - VERSION 2.9.1
+// ✅ Refactor-only: extract zip helpers + risk scoring + recommendations into lib/
+// ✅ No behavior change intended (pipeline identical)
 // ✅ Keeps backward compatibility (old + new payload shapes)
 
 import express from "express";
@@ -39,7 +38,7 @@ import {
   removeVisualObjectsFromPPTX,
 } from "./lib/sensitiveDataCleaner.js";
 
-// ✅ NEW: extracted helpers/policies (refactor only)
+// ✅ NEW: extracted helpers
 import { sendZip, outName, baseName } from "./lib/http/zip.js";
 import { calculateRiskScore, calculateAfterScore, getRiskLevel } from "./lib/policy/riskScore.js";
 import { generateRecommendations } from "./lib/policy/recommendations.js";
@@ -145,7 +144,7 @@ app.get("/health", (_, res) =>
   res.json({
     ok: true,
     service: "Qualion-Doc Backend",
-    version: "2.9.0",
+    version: "2.9.1",
     endpoints: ["/analyze", "/clean", "/rephrase"],
     features: [
       "approvedSpellingErrors",
@@ -158,13 +157,14 @@ app.get("/health", (_, res) =>
       "hidden-content-removal",
       "visual-objects-removal",
       "selective-cleaning-by-checkbox",
+      "refactor-riskScore-zip-helpers",
     ],
     time: new Date().toISOString(),
   })
 );
 
 // ===================================================================
-// POST /analyze - VERSION 2.9.0
+// POST /analyze - VERSION 2.9.1
 // ===================================================================
 app.post("/analyze", upload.single("file"), async (req, res) => {
   const startTime = Date.now();
@@ -180,9 +180,7 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
       });
     }
 
-    console.log(
-      `[ANALYZE] Processing ${req.file.originalname} (${(req.file.size / 1024).toFixed(1)} KB)`
-    );
+    console.log(`[ANALYZE] Processing ${req.file.originalname} (${(req.file.size / 1024).toFixed(1)} KB)`);
 
     const fileType = getMimeFromExt(ext);
     const analysisResult = await analyzeDocument(req.file.buffer, fileType);
@@ -246,7 +244,7 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
 });
 
 // ===================================================================
-// POST /clean - VERSION 2.9.0
+// POST /clean - VERSION 2.9.1
 // ✅ Select Items to Clean => REAL removal
 // ===================================================================
 app.post("/clean", upload.any(), async (req, res) => {
@@ -272,7 +270,526 @@ app.post("/clean", upload.any(), async (req, res) => {
     const approvedSpellingErrors = safeJsonParse(req.body.approvedSpellingErrors, []);
 
     // ✅ Detect if front is sending selective lists (even empty)
-    const hasSelectiveSensitive =
-      bodyHasKey(req, "sensitiveDataToClean") || bodyHasKey(req, "removeSensitiveData");
-    const hasSelectiveHidden =
-      bodyHasKey
+    const hasSelectiveSensitive = bodyHasKey(req, "sensitiveDataToClean") || bodyHasKey(req, "removeSensitiveData");
+    const hasSelectiveHidden = bodyHasKey(req, "hiddenContentToClean") || bodyHasKey(req, "hiddenContentToCleanRaw"); // (safe)
+    const hasSelectiveVisual = bodyHasKey(req, "visualObjectsToClean");
+
+    // ✅ Accept BOTH payload shapes from frontend (old + new)
+    const removeSensitiveDataRaw =
+      safeJsonParse(req.body.removeSensitiveData, null) ?? safeJsonParse(req.body.sensitiveDataToClean, []);
+
+    const hiddenContentToCleanRaw = safeJsonParse(req.body.hiddenContentToClean, []);
+    const visualObjectsToCleanRaw = safeJsonParse(req.body.visualObjectsToClean, []);
+
+    console.log(`[CLEAN] removeSensitiveData raw count: ${removeSensitiveDataRaw?.length || 0}`);
+    console.log(`[CLEAN] hiddenContentToClean raw count: ${hiddenContentToCleanRaw?.length || 0}`);
+    console.log(`[CLEAN] visualObjectsToClean raw count: ${visualObjectsToCleanRaw?.length || 0}`);
+    console.log(`[CLEAN] Selective modes: sensitive=${hasSelectiveSensitive}, hidden=${hasSelectiveHidden}, visual=${hasSelectiveVisual}`);
+
+    const single = files.length === 1;
+    const zip = new AdmZip();
+
+    for (const f of files) {
+      const ext = getExt(f.originalname);
+      const base = path.parse(f.originalname).name;
+
+      console.log(`[CLEAN] Processing ${f.originalname} with options:`, cleaningOptions);
+
+      // BEFORE structural stats
+      const documentStatsBefore = await safeExtractDocStats(f.buffer, ext);
+
+      // analysis (optional)
+      let analysisResult = null;
+      let spellingErrors = [];
+      let beforeRiskScore = 100;
+      let riskBreakdown = {};
+      let detections = null;
+      let summary = null;
+
+      try {
+        const fileType = getMimeFromExt(ext);
+        const fullAnalysis = await analyzeDocument(f.buffer, fileType);
+        detections = fullAnalysis.detections;
+
+        const rawSummary = fullAnalysis.summary;
+        summary = {
+          totalIssues: rawSummary.totalIssues,
+          critical: rawSummary.criticalIssues,
+          high: rawSummary.highIssues,
+          medium: rawSummary.mediumIssues,
+          low: rawSummary.lowIssues,
+        };
+
+        const riskResult = calculateRiskScore(summary, detections);
+        beforeRiskScore = riskResult.score;
+        riskBreakdown = riskResult.breakdown;
+
+        spellingErrors = detections.spellingErrors || [];
+
+        analysisResult = {
+          detections,
+          documentStats: documentStatsBefore,
+          summary: {
+            ...summary,
+            riskScore: beforeRiskScore,
+            beforeRiskScore,
+            riskBreakdown,
+            riskLevel: getRiskLevel(beforeRiskScore),
+            recommendations: generateRecommendations(detections),
+          },
+        };
+      } catch (analysisError) {
+        console.warn(`[CLEAN] Analysis failed, continuing without:`, analysisError?.message || analysisError);
+      }
+
+      // Map selection -> full objects
+      let sensitiveDataToRemove = [];
+      if ((removeSensitiveDataRaw?.length || 0) > 0 && detections?.sensitiveData) {
+        if (typeof removeSensitiveDataRaw[0] === "string") {
+          sensitiveDataToRemove = detections.sensitiveData.filter((d) => removeSensitiveDataRaw.includes(d.id));
+        } else {
+          sensitiveDataToRemove = removeSensitiveDataRaw;
+        }
+      }
+
+      let hiddenContentToRemove = [];
+      if ((hiddenContentToCleanRaw?.length || 0) > 0 && detections?.hiddenContent) {
+        if (typeof hiddenContentToCleanRaw[0] === "string") {
+          hiddenContentToRemove = detections.hiddenContent.filter((d) => hiddenContentToCleanRaw.includes(d.id));
+        } else {
+          hiddenContentToRemove = hiddenContentToCleanRaw;
+        }
+      }
+
+      let visualObjectsToRemove = [];
+      if ((visualObjectsToCleanRaw?.length || 0) > 0 && detections?.visualObjects) {
+        if (typeof visualObjectsToCleanRaw[0] === "string") {
+          visualObjectsToRemove = detections.visualObjects.filter((d) => visualObjectsToCleanRaw.includes(d.id));
+        } else {
+          visualObjectsToRemove = visualObjectsToCleanRaw;
+        }
+      }
+
+      console.log(`[CLEAN] Selected: sensitive=${sensitiveDataToRemove.length}, hidden=${hiddenContentToRemove.length}, visual=${visualObjectsToRemove.length}`);
+
+      // If approvedSpellingErrors is provided and not empty, use it
+      const spellingFixList =
+        Array.isArray(approvedSpellingErrors) && approvedSpellingErrors.length > 0 ? approvedSpellingErrors : spellingErrors;
+
+      // Track extra removals for score calculation
+      const extraRemovals = {
+        sensitiveDataRemoved: 0,
+        hiddenContentRemoved: 0,
+      };
+
+      // ---------------- DOCX ----------------
+      if (ext === "docx") {
+        let currentBuffer = f.buffer;
+
+        // Step 1: Standard cleaning (uses toggles)
+        const cleaned = await cleanDOCX(currentBuffer, { drawPolicy, ...cleaningOptions });
+        currentBuffer = cleaned.outBuffer;
+
+        // Step 2: Sensitive removal (SELECTED ONLY if list provided)
+        if (hasSelectiveSensitive) {
+          if (sensitiveDataToRemove.length > 0) {
+            const sensitiveResult = await removeSensitiveDataFromDOCX(currentBuffer, sensitiveDataToRemove);
+            currentBuffer = sensitiveResult.outBuffer;
+            extraRemovals.sensitiveDataRemoved = sensitiveResult.stats.removed;
+          }
+        }
+
+        // Step 3: Hidden content removal (SELECTED ONLY if list provided)
+        if (hasSelectiveHidden) {
+          if (hiddenContentToRemove.length > 0) {
+            const hiddenResult = await removeHiddenContentFromDOCX(currentBuffer, hiddenContentToRemove);
+            currentBuffer = hiddenResult.outBuffer;
+            extraRemovals.hiddenContentRemoved = hiddenResult.stats.removed;
+          }
+        }
+
+        // Step 4: Correct spelling
+        let correctionStats = null;
+        if (cleaningOptions.correctSpelling) {
+          const corrected = await correctDOCXText(currentBuffer, aiCorrectText, {
+            spellingErrors: spellingFixList,
+          });
+          currentBuffer = corrected.outBuffer;
+          correctionStats = corrected.stats;
+        }
+
+        // AFTER stats
+        const documentStatsAfter = await safeExtractDocStats(currentBuffer, ext);
+
+        zip.addFile(outName(single, base, "cleaned.docx"), currentBuffer);
+
+        const afterResult = calculateAfterScore(beforeRiskScore, cleaned.stats, correctionStats, riskBreakdown, extraRemovals);
+
+        addReportsToZip(zip, single, base, {
+          filename: f.originalname,
+          ext,
+          policy: { drawPolicy, ...cleaningOptions },
+          cleaning: {
+            ...cleaned.stats,
+            sensitiveDataRemoved: extraRemovals.sensitiveDataRemoved,
+            hiddenContentRemoved: extraRemovals.hiddenContentRemoved,
+          },
+          correction: correctionStats,
+          analysis: analysisResult,
+          spellingErrors,
+          approvedSpellingErrors,
+          beforeRiskScore,
+          afterRiskScore: afterResult.score,
+          scoreImpacts: afterResult.scoreImpacts,
+          documentStatsBefore,
+          documentStatsAfter,
+        });
+
+        continue;
+      }
+
+      // ---------------- PPTX ----------------
+      if (ext === "pptx") {
+        let currentBuffer = f.buffer;
+
+        // Step 1: Standard cleaning
+        const cleaned = await cleanPPTX(currentBuffer, { drawPolicy, ...cleaningOptions });
+        currentBuffer = cleaned.outBuffer;
+
+        // Step 2: Sensitive (selected only)
+        if (hasSelectiveSensitive) {
+          if (sensitiveDataToRemove.length > 0) {
+            const sensitiveResult = await removeSensitiveDataFromPPTX(currentBuffer, sensitiveDataToRemove);
+            currentBuffer = sensitiveResult.outBuffer;
+            extraRemovals.sensitiveDataRemoved = sensitiveResult.stats.removed;
+          }
+        }
+
+        // Step 3: Hidden (selected only)
+        if (hasSelectiveHidden) {
+          if (hiddenContentToRemove.length > 0) {
+            const hiddenResult = await removeHiddenContentFromPPTX(currentBuffer, hiddenContentToRemove);
+            currentBuffer = hiddenResult.outBuffer;
+            extraRemovals.hiddenContentRemoved = hiddenResult.stats.removed;
+          }
+        }
+
+        // Step 4: Visual objects (selected only)
+        if (hasSelectiveVisual) {
+          if (visualObjectsToRemove.length > 0) {
+            const visualResult = await removeVisualObjectsFromPPTX(currentBuffer, visualObjectsToRemove);
+            currentBuffer = visualResult.outBuffer;
+          }
+        }
+
+        // Step 5: Correct spelling
+        let correctionStats = null;
+        if (cleaningOptions.correctSpelling) {
+          const corrected = await correctPPTXText(currentBuffer, aiCorrectText, {
+            spellingErrors: spellingFixList,
+          });
+          currentBuffer = corrected.outBuffer;
+          correctionStats = corrected.stats;
+        }
+
+        // AFTER stats
+        const documentStatsAfter = await safeExtractDocStats(currentBuffer, ext);
+
+        zip.addFile(outName(single, base, "cleaned.pptx"), currentBuffer);
+
+        const afterResult = calculateAfterScore(beforeRiskScore, cleaned.stats, correctionStats, riskBreakdown, extraRemovals);
+
+        addReportsToZip(zip, single, base, {
+          filename: f.originalname,
+          ext,
+          policy: { drawPolicy, ...cleaningOptions },
+          cleaning: {
+            ...cleaned.stats,
+            sensitiveDataRemoved: extraRemovals.sensitiveDataRemoved,
+            hiddenContentRemoved: extraRemovals.hiddenContentRemoved,
+          },
+          correction: correctionStats,
+          analysis: analysisResult,
+          spellingErrors,
+          approvedSpellingErrors,
+          beforeRiskScore,
+          afterRiskScore: afterResult.score,
+          scoreImpacts: afterResult.scoreImpacts,
+          documentStatsBefore,
+          documentStatsAfter,
+        });
+
+        continue;
+      }
+
+      // ---------------- PDF ----------------
+      if (ext === "pdf") {
+        const cleaned = await cleanPDF(f.buffer, {
+          pdfMode: pdfMode === "text-only" ? "text-only" : "sanitize",
+          extractTextFn: async (b) => filterExtractedLines(await extractPdfText(b), { strictPdf: true }),
+        });
+
+        zip.addFile(outName(single, base, pdfMode === "text-only" ? "text_only.pdf" : "sanitized.pdf"), cleaned.outBuffer);
+
+        let correctionStats = null;
+        if (includePdfDocx) {
+          const raw = await extractPdfText(cleaned.outBuffer);
+          const filtered = filterExtractedLines(raw, { strictPdf: true });
+          const correctedTxt = await aiCorrectText(filtered);
+          const docxFromPdf = await createDocxFromText(correctedTxt || filtered, base || "corrected");
+          zip.addFile(outName(single, base, "corrected_from_pdf.docx"), docxFromPdf);
+
+          correctionStats = {
+            totalTextNodes: 0,
+            changedTextNodes: correctedTxt && filtered ? (correctedTxt.trim() === filtered.trim() ? 0 : 1) : 0,
+            examples:
+              correctedTxt && filtered && correctedTxt.trim() !== filtered.trim()
+                ? [{ before: filtered.slice(0, 140), after: correctedTxt.slice(0, 140) }]
+                : [],
+          };
+        }
+
+        const documentStatsAfter = await safeExtractDocStats(cleaned.outBuffer, ext);
+
+        const afterResult = calculateAfterScore(beforeRiskScore, cleaned.stats, correctionStats, riskBreakdown, extraRemovals);
+
+        addReportsToZip(zip, single, base, {
+          filename: f.originalname,
+          ext,
+          policy: { pdfMode, ...cleaningOptions },
+          cleaning: cleaned.stats,
+          correction: correctionStats,
+          analysis: analysisResult,
+          spellingErrors,
+          approvedSpellingErrors,
+          beforeRiskScore,
+          afterRiskScore: afterResult.score,
+          scoreImpacts: afterResult.scoreImpacts,
+          documentStatsBefore,
+          documentStatsAfter,
+        });
+
+        continue;
+      }
+
+      // ---------------- XLSX ----------------
+      if (ext === "xlsx") {
+        let currentBuffer = f.buffer;
+
+        // Step 1: Standard cleaning
+        const cleaned = await cleanXLSX(currentBuffer, cleaningOptions);
+        currentBuffer = cleaned.outBuffer;
+
+        // Step 2: Sensitive (selected only)
+        if (hasSelectiveSensitive) {
+          if (sensitiveDataToRemove.length > 0) {
+            const sensitiveResult = await removeSensitiveDataFromXLSX(currentBuffer, sensitiveDataToRemove);
+            currentBuffer = sensitiveResult.outBuffer;
+            extraRemovals.sensitiveDataRemoved = sensitiveResult.stats.removed;
+          }
+        }
+
+        // Step 3: Correct spelling
+        let correctionStats = null;
+        if (cleaningOptions.correctSpelling) {
+          const corrected = await correctXLSXText(currentBuffer, aiCorrectText, {
+            spellingErrors: spellingFixList,
+          });
+          currentBuffer = corrected.outBuffer;
+          correctionStats = corrected.stats;
+        }
+
+        const documentStatsAfter = await safeExtractDocStats(currentBuffer, ext);
+
+        zip.addFile(outName(single, base, "cleaned.xlsx"), currentBuffer);
+
+        const afterResult = calculateAfterScore(beforeRiskScore, cleaned.stats, correctionStats, riskBreakdown, extraRemovals);
+
+        addReportsToZip(zip, single, base, {
+          filename: f.originalname,
+          ext,
+          policy: cleaningOptions,
+          cleaning: { ...cleaned.stats, sensitiveDataRemoved: extraRemovals.sensitiveDataRemoved },
+          correction: correctionStats,
+          analysis: analysisResult,
+          spellingErrors,
+          approvedSpellingErrors,
+          beforeRiskScore,
+          afterRiskScore: afterResult.score,
+          scoreImpacts: afterResult.scoreImpacts,
+          documentStatsBefore,
+          documentStatsAfter,
+        });
+
+        continue;
+      }
+
+      // ---------------- Other ----------------
+      zip.addFile(outName(single, base, f.originalname), f.buffer);
+
+      addReportsToZip(zip, single, base, {
+        filename: f.originalname,
+        ext,
+        policy: {},
+        cleaning: {},
+        correction: null,
+        analysis: null,
+        spellingErrors: [],
+        approvedSpellingErrors: [],
+        beforeRiskScore: 100,
+        afterRiskScore: 100,
+        scoreImpacts: {},
+        documentStatsBefore,
+        documentStatsAfter: documentStatsBefore,
+      });
+    }
+
+    const zipName = files.length === 1 ? `${baseName(files[0].originalname)} cleaned.zip` : "qualion_doc_cleaned.zip";
+    sendZip(res, zip, zipName);
+  } catch (e) {
+    console.error("CLEAN ERROR", e);
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
+// ===================================================================
+// POST /rephrase - VERSION 2.9.1
+// ===================================================================
+app.post("/rephrase", upload.any(), async (req, res) => {
+  try {
+    const files = req.files || [];
+    if (!files.length) return res.status(400).json({ error: "No files uploaded." });
+
+    const drawPolicy = (req.body.drawPolicy || "auto").toLowerCase();
+    const single = files.length === 1;
+    const zip = new AdmZip();
+
+    for (const f of files) {
+      const ext = getExt(f.originalname);
+      const base = path.parse(f.originalname).name;
+
+      const documentStatsBefore = await safeExtractDocStats(f.buffer, ext);
+
+      let analysisResult = null;
+      let spellingErrors = [];
+      let beforeRiskScore = 100;
+      let riskBreakdown = {};
+      let detections = null;
+      let summary = null;
+
+      try {
+        const fileType = getMimeFromExt(ext);
+        const fullAnalysis = await analyzeDocument(f.buffer, fileType);
+        detections = fullAnalysis.detections;
+
+        const rawSummary = fullAnalysis.summary;
+        summary = {
+          totalIssues: rawSummary.totalIssues,
+          critical: rawSummary.criticalIssues,
+          high: rawSummary.highIssues,
+          medium: rawSummary.mediumIssues,
+          low: rawSummary.lowIssues,
+        };
+
+        const riskResult = calculateRiskScore(summary, detections);
+        beforeRiskScore = riskResult.score;
+        riskBreakdown = riskResult.breakdown;
+
+        spellingErrors = detections.spellingErrors || [];
+
+        analysisResult = {
+          detections,
+          documentStats: documentStatsBefore,
+          summary: {
+            ...summary,
+            riskScore: beforeRiskScore,
+            beforeRiskScore,
+            riskBreakdown,
+            riskLevel: getRiskLevel(beforeRiskScore),
+            recommendations: generateRecommendations(detections),
+          },
+        };
+      } catch (analysisError) {
+        console.warn(`[REPHRASE] Analysis failed:`, analysisError?.message || analysisError);
+      }
+
+      if (ext === "docx") {
+        const cleaned = await cleanDOCX(f.buffer, { drawPolicy });
+
+        const rephrased = await correctDOCXText(cleaned.outBuffer, aiCorrectText, {
+          mode: "rephrase",
+          spellingErrors,
+        });
+
+        const documentStatsAfter = await safeExtractDocStats(rephrased.outBuffer, ext);
+
+        zip.addFile(outName(single, base, "rephrased.docx"), rephrased.outBuffer);
+
+        const afterResult = calculateAfterScore(beforeRiskScore, cleaned.stats, rephrased.stats, riskBreakdown, {});
+
+        addReportsToZip(zip, single, base, {
+          filename: f.originalname,
+          ext,
+          policy: { drawPolicy, mode: "rephrase" },
+          cleaning: cleaned.stats,
+          correction: rephrased.stats,
+          analysis: analysisResult,
+          spellingErrors,
+          beforeRiskScore,
+          afterRiskScore: afterResult.score,
+          scoreImpacts: afterResult.scoreImpacts,
+          documentStatsBefore,
+          documentStatsAfter,
+        });
+      } else if (ext === "pptx") {
+        const cleaned = await cleanPPTX(f.buffer, { drawPolicy });
+
+        const rephrased = await correctPPTXText(cleaned.outBuffer, aiCorrectText, {
+          mode: "rephrase",
+          spellingErrors,
+        });
+
+        const documentStatsAfter = await safeExtractDocStats(rephrased.outBuffer, ext);
+
+        zip.addFile(outName(single, base, "rephrased.pptx"), rephrased.outBuffer);
+
+        const afterResult = calculateAfterScore(beforeRiskScore, cleaned.stats, rephrased.stats, riskBreakdown, {});
+
+        addReportsToZip(zip, single, base, {
+          filename: f.originalname,
+          ext,
+          policy: { drawPolicy, mode: "rephrase" },
+          cleaning: cleaned.stats,
+          correction: rephrased.stats,
+          analysis: analysisResult,
+          spellingErrors,
+          beforeRiskScore,
+          afterRiskScore: afterResult.score,
+          scoreImpacts: afterResult.scoreImpacts,
+          documentStatsBefore,
+          documentStatsAfter,
+        });
+      } else if (ext === "pdf") {
+        return res.status(400).json({
+          error: "Rephrase for PDF is disabled. Convert to DOCX/PPTX first.",
+        });
+      } else {
+        return res.status(400).json({ error: `Unsupported file for rephrase: .${ext}` });
+      }
+    }
+
+    const zipName = files.length === 1 ? `${baseName(files[0].originalname)} rephrased.zip` : "qualion_doc_rephrased.zip";
+    sendZip(res, zip, zipName);
+  } catch (e) {
+    console.error("REPHRASE ERROR", e);
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
+// ---------- Boot ----------
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log(`✅ Qualion-Doc Backend v2.9.1 listening on port ${PORT}`);
+  console.log(`   Endpoints: GET /health, POST /analyze, POST /clean, POST /rephrase`);
+  console.log(`   Features: selective-cleaning-by-checkbox + docStats fixed + refactor helpers`);
+});
