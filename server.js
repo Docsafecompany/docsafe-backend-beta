@@ -1,4 +1,9 @@
-// server.js - VERSION 2.8.0 (adds sensitive data & hidden content ACTUAL REMOVAL)
+// server.js - VERSION 2.9.0
+// ✅ Fix Render crash (brace structure)
+// ✅ docStats signature fixed (extractDocStats({ ext, buffer }))
+// ✅ Select Items to Clean => REAL removal (selected only when provided)
+// ✅ Keeps backward compatibility (old + new payload shapes)
+
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -11,11 +16,7 @@ import { v4 as uuidv4 } from "uuid";
 import { cleanDOCX } from "./lib/docxCleaner.js";
 import { cleanPPTX } from "./lib/pptxCleaner.js";
 import { cleanPDF } from "./lib/pdfCleaner.js";
-import {
-  correctDOCXText,
-  correctPPTXText,
-  correctXLSXText,
-} from "./lib/officeCorrect.js";
+import { correctDOCXText, correctPPTXText, correctXLSXText } from "./lib/officeCorrect.js";
 import { buildReportHtmlDetailed, buildReportData } from "./lib/report.js";
 import { extractPdfText, filterExtractedLines } from "./lib/pdfTools.js";
 import { createDocxFromText } from "./lib/docxWriter.js";
@@ -25,10 +26,10 @@ import { cleanXLSX } from "./lib/xlsxCleaner.js";
 // Import de documentAnalyzer
 import { analyzeDocument } from "./lib/documentAnalyzer.js";
 
-// 🆕 Import docStats
+// 🆕 Import docStats (NEW SIGNATURE)
 import { extractDocStats } from "./lib/docStats.js";
 
-// 🆕 Import sensitive data cleaner (NEW FILE)
+// 🆕 Import sensitive data cleaner
 import {
   removeSensitiveDataFromDOCX,
   removeSensitiveDataFromPPTX,
@@ -42,6 +43,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
+
 app.use(
   cors({
     origin: [
@@ -56,6 +58,7 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
+
 app.use(express.json({ limit: "100mb" }));
 app.use(express.urlencoded({ extended: true, limit: "100mb" }));
 
@@ -65,8 +68,7 @@ const upload = multer({
 });
 
 // ---------- Helpers ----------
-const getExt = (fn = "") =>
-  fn.includes(".") ? fn.split(".").pop().toLowerCase() : "";
+const getExt = (fn = "") => (fn.includes(".") ? fn.split(".").pop().toLowerCase() : "");
 
 const getMimeFromExt = (ext) => {
   const map = {
@@ -87,27 +89,39 @@ function sendZip(res, zip, zipName) {
   res.send(zip.toBuffer());
 }
 
-// 🆕 Safe wrapper for doc stats (never breaks pipeline)
+// ✅ Safe wrapper for doc stats (never breaks pipeline)
+// IMPORTANT: extractDocStats signature is now extractDocStats({ ext, buffer, ... })
 async function safeExtractDocStats(buffer, ext) {
   try {
-    const stats = await extractDocStats(buffer, ext);
+    const stats = await extractDocStats({ ext, buffer });
     return (
       stats || {
         pages: null,
         slides: null,
         sheets: null,
         tables: null,
+        paragraphs: null,
+        approxWords: null,
       }
     );
   } catch (e) {
     console.warn("[DOC STATS] Failed:", e?.message || e);
-    return { pages: null, slides: null, sheets: null, tables: null };
+    return {
+      pages: null,
+      slides: null,
+      sheets: null,
+      tables: null,
+      paragraphs: null,
+      approxWords: null,
+    };
   }
 }
 
 // 🆕 Safe JSON parse helper
 function safeJsonParse(str, fallback = []) {
-  if (!str) return fallback;
+  if (str === undefined || str === null) return fallback;
+  if (typeof str !== "string") return fallback;
+  if (!str.trim()) return fallback;
   try {
     const parsed = JSON.parse(str);
     return Array.isArray(parsed) ? parsed : fallback;
@@ -115,6 +129,11 @@ function safeJsonParse(str, fallback = []) {
     console.warn("[JSON PARSE] Failed:", e?.message);
     return fallback;
   }
+}
+
+// Helper: detect if a key was provided (even if empty array)
+function bodyHasKey(req, key) {
+  return Object.prototype.hasOwnProperty.call(req.body || {}, key);
 }
 
 // ============================================================
@@ -160,9 +179,7 @@ function calculateRiskScore(summary, detections = null) {
       breakdown.macros = penalty;
     }
 
-    const hiddenCount =
-      (detections.hiddenContent?.length || 0) +
-      (detections.hiddenSheets?.length || 0);
+    const hiddenCount = (detections.hiddenContent?.length || 0) + (detections.hiddenSheets?.length || 0);
     if (hiddenCount > 0) {
       const penalty = Math.min(hiddenCount * 8, 24);
       score -= penalty;
@@ -218,15 +235,8 @@ function calculateRiskScore(summary, detections = null) {
       breakdown.complianceRisks = penalty;
     }
   } else {
-    const classifiedIssues =
-      (summary.critical || 0) +
-      (summary.high || 0) +
-      (summary.medium || 0) +
-      (summary.low || 0);
-    const unclassifiedIssues = Math.max(
-      0,
-      (summary.totalIssues || 0) - classifiedIssues
-    );
+    const classifiedIssues = (summary.critical || 0) + (summary.high || 0) + (summary.medium || 0) + (summary.low || 0);
+    const unclassifiedIssues = Math.max(0, (summary.totalIssues || 0) - classifiedIssues);
 
     if (unclassifiedIssues > 0) {
       const penalty = unclassifiedIssues * 5;
@@ -242,23 +252,14 @@ function calculateRiskScore(summary, detections = null) {
   }
 
   const finalScore = Math.max(0, Math.min(100, score));
-  console.log(
-    `[RISK SCORE] Calculated: ${finalScore} (total issues: ${summary.totalIssues})`,
-    breakdown
-  );
+  console.log(`[RISK SCORE] Calculated: ${finalScore} (total issues: ${summary.totalIssues})`, breakdown);
   return { score: finalScore, breakdown };
 }
 
 // ============================================================
 // Calcul du score APRÈS nettoyage
 // ============================================================
-function calculateAfterScore(
-  beforeScore,
-  cleaningStats,
-  correctionStats,
-  riskBreakdown = {},
-  extraRemovals = {}
-) {
+function calculateAfterScore(beforeScore, cleaningStats, correctionStats, riskBreakdown = {}, extraRemovals = {}) {
   let improvement = 0;
   const scoreImpacts = {};
 
@@ -337,14 +338,14 @@ function calculateAfterScore(
     scoreImpacts.spellingGrammar = impact;
   }
 
-  // 🆕 Account for sensitive data removal
+  // 🆕 sensitive data removal
   if (extraRemovals.sensitiveDataRemoved > 0 && riskBreakdown.sensitiveData) {
     const impact = Math.min(extraRemovals.sensitiveDataRemoved * 25, riskBreakdown.sensitiveData);
     improvement += impact;
     scoreImpacts.sensitiveData = impact;
   }
 
-  // 🆕 Account for hidden content removal
+  // 🆕 hidden content removal
   if (extraRemovals.hiddenContentRemoved > 0 && riskBreakdown.hiddenContent) {
     const impact = Math.min(extraRemovals.hiddenContentRemoved * 8, riskBreakdown.hiddenContent);
     improvement += impact;
@@ -358,25 +359,15 @@ function calculateAfterScore(
 function generateRecommendations(detections) {
   const recommendations = [];
   if (detections.metadata?.length > 0)
-    recommendations.push(
-      "Remove document metadata to protect author and organization information."
-    );
+    recommendations.push("Remove document metadata to protect author and organization information.");
   if (detections.comments?.length > 0)
-    recommendations.push(
-      `Review and remove ${detections.comments.length} comment(s) before sharing externally.`
-    );
+    recommendations.push(`Review and remove ${detections.comments.length} comment(s) before sharing externally.`);
   if (detections.trackChanges?.length > 0)
-    recommendations.push(
-      "Accept or reject all tracked changes to finalize the document."
-    );
+    recommendations.push("Accept or reject all tracked changes to finalize the document.");
   if (detections.hiddenContent?.length > 0 || detections.hiddenSheets?.length > 0)
-    recommendations.push(
-      "Remove hidden content that could expose confidential information."
-    );
+    recommendations.push("Remove hidden content that could expose confidential information.");
   if (detections.macros?.length > 0)
-    recommendations.push(
-      "Remove macros for security - they can contain executable code."
-    );
+    recommendations.push("Remove macros for security - they can contain executable code.");
   if (detections.sensitiveData?.length > 0) {
     const types = [...new Set(detections.sensitiveData.map((d) => d.type))];
     recommendations.push(`Review sensitive data detected: ${types.join(", ")}.`);
@@ -384,13 +375,9 @@ function generateRecommendations(detections) {
   if (detections.embeddedObjects?.length > 0)
     recommendations.push("Remove embedded objects that may contain hidden data.");
   if (detections.spellingErrors?.length > 0)
-    recommendations.push(
-      `${detections.spellingErrors.length} spelling/grammar issue(s) were detected.`
-    );
+    recommendations.push(`${detections.spellingErrors.length} spelling/grammar issue(s) were detected.`);
   if (recommendations.length === 0)
-    recommendations.push(
-      "Document appears clean. Minor review recommended before external sharing."
-    );
+    recommendations.push("Document appears clean. Minor review recommended before external sharing.");
   return recommendations;
 }
 
@@ -407,10 +394,7 @@ function addReportsToZip(zip, single, base, reportParams) {
   zip.addFile(outName(single, base, "report.html"), Buffer.from(reportHtml, "utf8"));
 
   const reportJson = buildReportData(reportParams);
-  zip.addFile(
-    outName(single, base, "report.json"),
-    Buffer.from(JSON.stringify(reportJson, null, 2), "utf8")
-  );
+  zip.addFile(outName(single, base, "report.json"), Buffer.from(JSON.stringify(reportJson, null, 2), "utf8"));
 }
 
 // ---------- Health ----------
@@ -418,7 +402,7 @@ app.get("/health", (_, res) =>
   res.json({
     ok: true,
     service: "Qualion-Doc Backend",
-    version: "2.8.0",
+    version: "2.9.0",
     endpoints: ["/analyze", "/clean", "/rephrase"],
     features: [
       "approvedSpellingErrors",
@@ -429,13 +413,15 @@ app.get("/health", (_, res) =>
       "documentStats-before-after",
       "sensitive-data-removal",
       "hidden-content-removal",
+      "visual-objects-removal",
+      "selective-cleaning-by-checkbox",
     ],
     time: new Date().toISOString(),
   })
 );
 
 // ===================================================================
-// POST /analyze - VERSION 2.8.0
+// POST /analyze - VERSION 2.9.0
 // ===================================================================
 app.post("/analyze", upload.single("file"), async (req, res) => {
   const startTime = Date.now();
@@ -452,9 +438,7 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
     }
 
     console.log(
-      `[ANALYZE] Processing ${req.file.originalname} (${(
-        req.file.size / 1024
-      ).toFixed(1)} KB)`
+      `[ANALYZE] Processing ${req.file.originalname} (${(req.file.size / 1024).toFixed(1)} KB)`
     );
 
     const fileType = getMimeFromExt(ext);
@@ -472,7 +456,7 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
 
     const { score: riskScore, breakdown } = calculateRiskScore(summary, detections);
 
-    // documentStats
+    // ✅ documentStats
     const documentStats = await safeExtractDocStats(req.file.buffer, ext);
 
     res.json({
@@ -519,7 +503,8 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
 });
 
 // ===================================================================
-// POST /clean  → VERSION 2.8.0 (ACTUAL REMOVAL of sensitive data & hidden content)
+// POST /clean - VERSION 2.9.0
+// ✅ Select Items to Clean => REAL removal
 // ===================================================================
 app.post("/clean", upload.any(), async (req, res) => {
   try {
@@ -543,32 +528,26 @@ app.post("/clean", upload.any(), async (req, res) => {
     // ✅ Parse approved spelling errors
     const approvedSpellingErrors = safeJsonParse(req.body.approvedSpellingErrors, []);
 
+    // ✅ Detect if front is sending selective lists (even empty)
+    const hasSelectiveSensitive =
+      bodyHasKey(req, "sensitiveDataToClean") || bodyHasKey(req, "removeSensitiveData");
+    const hasSelectiveHidden =
+      bodyHasKey(req, "hiddenContentToClean") || bodyHasKey(req, "hiddenContentToCleanRaw"); // (safe)
+    const hasSelectiveVisual = bodyHasKey(req, "visualObjectsToClean");
+
     // ✅ Accept BOTH payload shapes from frontend (old + new)
     const removeSensitiveDataRaw =
-      safeJsonParse(req.body.removeSensitiveData, null) ??
-      safeJsonParse(req.body.sensitiveDataToClean, []);
+      safeJsonParse(req.body.removeSensitiveData, null) ?? safeJsonParse(req.body.sensitiveDataToClean, []);
 
     const hiddenContentToCleanRaw = safeJsonParse(req.body.hiddenContentToClean, []);
     const visualObjectsToCleanRaw = safeJsonParse(req.body.visualObjectsToClean, []);
 
-    // Optional debug: if full objects, log the values
-    try {
-      if (Array.isArray(removeSensitiveDataRaw) && removeSensitiveDataRaw.length > 0) {
-        const first = removeSensitiveDataRaw[0];
-        if (typeof first === "object" && first?.value) {
-          console.log(
-            "[CLEAN] sensitiveData values:",
-            removeSensitiveDataRaw.map((s) => s?.value).filter(Boolean)
-          );
-        }
-      }
-    } catch (e) {
-      console.warn("[CLEAN] sensitiveData log error:", e?.message || e);
-    }
-
-    console.log(`[CLEAN] removeSensitiveData: ${removeSensitiveDataRaw?.length || 0} items`);
-    console.log(`[CLEAN] hiddenContentToClean: ${hiddenContentToCleanRaw.length} items`);
-    console.log(`[CLEAN] visualObjectsToClean: ${visualObjectsToCleanRaw.length} items`);
+    console.log(`[CLEAN] removeSensitiveData raw count: ${removeSensitiveDataRaw?.length || 0}`);
+    console.log(`[CLEAN] hiddenContentToClean raw count: ${hiddenContentToCleanRaw?.length || 0}`);
+    console.log(`[CLEAN] visualObjectsToClean raw count: ${visualObjectsToCleanRaw?.length || 0}`);
+    console.log(
+      `[CLEAN] Selective modes: sensitive=${hasSelectiveSensitive}, hidden=${hasSelectiveHidden}, visual=${hasSelectiveVisual}`
+    );
 
     const single = files.length === 1;
     const zip = new AdmZip();
@@ -582,6 +561,7 @@ app.post("/clean", upload.any(), async (req, res) => {
       // BEFORE structural stats
       const documentStatsBefore = await safeExtractDocStats(f.buffer, ext);
 
+      // analysis (optional)
       let analysisResult = null;
       let spellingErrors = [];
       let beforeRiskScore = 100;
@@ -625,44 +605,36 @@ app.post("/clean", upload.any(), async (req, res) => {
         console.warn(`[CLEAN] Analysis failed, continuing without:`, analysisError?.message || analysisError);
       }
 
-      // 🆕 Map IDs to full detection objects for sensitive data
+      // Map selection -> full objects
       let sensitiveDataToRemove = [];
-      if (removeSensitiveDataRaw?.length > 0 && detections?.sensitiveData) {
+      if ((removeSensitiveDataRaw?.length || 0) > 0 && detections?.sensitiveData) {
         if (typeof removeSensitiveDataRaw[0] === "string") {
-          sensitiveDataToRemove = detections.sensitiveData.filter((d) =>
-            removeSensitiveDataRaw.includes(d.id)
-          );
+          sensitiveDataToRemove = detections.sensitiveData.filter((d) => removeSensitiveDataRaw.includes(d.id));
         } else {
           sensitiveDataToRemove = removeSensitiveDataRaw;
         }
       }
 
-      // 🆕 Map IDs to full detection objects for hidden content
       let hiddenContentToRemove = [];
-      if (hiddenContentToCleanRaw?.length > 0 && detections?.hiddenContent) {
+      if ((hiddenContentToCleanRaw?.length || 0) > 0 && detections?.hiddenContent) {
         if (typeof hiddenContentToCleanRaw[0] === "string") {
-          hiddenContentToRemove = detections.hiddenContent.filter((d) =>
-            hiddenContentToCleanRaw.includes(d.id)
-          );
+          hiddenContentToRemove = detections.hiddenContent.filter((d) => hiddenContentToCleanRaw.includes(d.id));
         } else {
           hiddenContentToRemove = hiddenContentToCleanRaw;
         }
       }
 
-      // 🆕 Map IDs for visual objects
       let visualObjectsToRemove = [];
-      if (visualObjectsToCleanRaw?.length > 0 && detections?.visualObjects) {
+      if ((visualObjectsToCleanRaw?.length || 0) > 0 && detections?.visualObjects) {
         if (typeof visualObjectsToCleanRaw[0] === "string") {
-          visualObjectsToRemove = detections.visualObjects.filter((d) =>
-            visualObjectsToCleanRaw.includes(d.id)
-          );
+          visualObjectsToRemove = detections.visualObjects.filter((d) => visualObjectsToCleanRaw.includes(d.id));
         } else {
           visualObjectsToRemove = visualObjectsToCleanRaw;
         }
       }
 
       console.log(
-        `[CLEAN] Will remove: ${sensitiveDataToRemove.length} sensitive, ${hiddenContentToRemove.length} hidden, ${visualObjectsToRemove.length} visual`
+        `[CLEAN] Selected: sensitive=${sensitiveDataToRemove.length}, hidden=${hiddenContentToRemove.length}, visual=${visualObjectsToRemove.length}`
       );
 
       // If approvedSpellingErrors is provided and not empty, use it
@@ -677,25 +649,35 @@ app.post("/clean", upload.any(), async (req, res) => {
         hiddenContentRemoved: 0,
       };
 
+      // ---------------- DOCX ----------------
       if (ext === "docx") {
         let currentBuffer = f.buffer;
 
-        // Step 1: Standard cleaning
+        // Step 1: Standard cleaning (uses toggles)
         const cleaned = await cleanDOCX(currentBuffer, { drawPolicy, ...cleaningOptions });
         currentBuffer = cleaned.outBuffer;
 
-        // 🆕 Step 2: Remove sensitive data
-        if (sensitiveDataToRemove.length > 0) {
-          const sensitiveResult = await removeSensitiveDataFromDOCX(currentBuffer, sensitiveDataToRemove);
-          currentBuffer = sensitiveResult.outBuffer;
-          extraRemovals.sensitiveDataRemoved = sensitiveResult.stats.removed;
+        // Step 2: Sensitive removal (SELECTED ONLY if list provided)
+        if (hasSelectiveSensitive) {
+          if (sensitiveDataToRemove.length > 0) {
+            const sensitiveResult = await removeSensitiveDataFromDOCX(currentBuffer, sensitiveDataToRemove);
+            currentBuffer = sensitiveResult.outBuffer;
+            extraRemovals.sensitiveDataRemoved = sensitiveResult.stats.removed;
+          }
+        } else {
+          // legacy behavior: if toggle implies removing all sensitive (only if you had such logic elsewhere)
+          // here we do nothing unless user sent selection
         }
 
-        // 🆕 Step 3: Remove hidden content
-        if (hiddenContentToRemove.length > 0) {
-          const hiddenResult = await removeHiddenContentFromDOCX(currentBuffer, hiddenContentToRemove);
-          currentBuffer = hiddenResult.outBuffer;
-          extraRemovals.hiddenContentRemoved = hiddenResult.stats.removed;
+        // Step 3: Hidden content removal (SELECTED ONLY if list provided)
+        if (hasSelectiveHidden) {
+          if (hiddenContentToRemove.length > 0) {
+            const hiddenResult = await removeHiddenContentFromDOCX(currentBuffer, hiddenContentToRemove);
+            currentBuffer = hiddenResult.outBuffer;
+            extraRemovals.hiddenContentRemoved = hiddenResult.stats.removed;
+          }
+        } else {
+          // legacy behavior handled by cleanDOCX(removeHiddenContent)
         }
 
         // Step 4: Correct spelling
@@ -708,18 +690,28 @@ app.post("/clean", upload.any(), async (req, res) => {
           correctionStats = corrected.stats;
         }
 
-        // AFTER structural stats
+        // AFTER stats
         const documentStatsAfter = await safeExtractDocStats(currentBuffer, ext);
 
         zip.addFile(outName(single, base, "cleaned.docx"), currentBuffer);
 
-        const afterResult = calculateAfterScore(beforeRiskScore, cleaned.stats, correctionStats, riskBreakdown, extraRemovals);
+        const afterResult = calculateAfterScore(
+          beforeRiskScore,
+          cleaned.stats,
+          correctionStats,
+          riskBreakdown,
+          extraRemovals
+        );
 
         addReportsToZip(zip, single, base, {
           filename: f.originalname,
           ext,
           policy: { drawPolicy, ...cleaningOptions },
-          cleaning: { ...cleaned.stats, sensitiveDataRemoved: extraRemovals.sensitiveDataRemoved, hiddenContentRemoved: extraRemovals.hiddenContentRemoved },
+          cleaning: {
+            ...cleaned.stats,
+            sensitiveDataRemoved: extraRemovals.sensitiveDataRemoved,
+            hiddenContentRemoved: extraRemovals.hiddenContentRemoved,
+          },
           correction: correctionStats,
           analysis: analysisResult,
           spellingErrors,
@@ -731,31 +723,41 @@ app.post("/clean", upload.any(), async (req, res) => {
           documentStatsAfter,
         });
 
-      } else if (ext === "pptx") {
+        continue;
+      }
+
+      // ---------------- PPTX ----------------
+      if (ext === "pptx") {
         let currentBuffer = f.buffer;
 
         // Step 1: Standard cleaning
         const cleaned = await cleanPPTX(currentBuffer, { drawPolicy, ...cleaningOptions });
         currentBuffer = cleaned.outBuffer;
 
-        // 🆕 Step 2: Remove sensitive data
-        if (sensitiveDataToRemove.length > 0) {
-          const sensitiveResult = await removeSensitiveDataFromPPTX(currentBuffer, sensitiveDataToRemove);
-          currentBuffer = sensitiveResult.outBuffer;
-          extraRemovals.sensitiveDataRemoved = sensitiveResult.stats.removed;
+        // Step 2: Sensitive (selected only)
+        if (hasSelectiveSensitive) {
+          if (sensitiveDataToRemove.length > 0) {
+            const sensitiveResult = await removeSensitiveDataFromPPTX(currentBuffer, sensitiveDataToRemove);
+            currentBuffer = sensitiveResult.outBuffer;
+            extraRemovals.sensitiveDataRemoved = sensitiveResult.stats.removed;
+          }
         }
 
-        // 🆕 Step 3: Remove hidden content
-        if (hiddenContentToRemove.length > 0) {
-          const hiddenResult = await removeHiddenContentFromPPTX(currentBuffer, hiddenContentToRemove);
-          currentBuffer = hiddenResult.outBuffer;
-          extraRemovals.hiddenContentRemoved = hiddenResult.stats.removed;
+        // Step 3: Hidden (selected only)
+        if (hasSelectiveHidden) {
+          if (hiddenContentToRemove.length > 0) {
+            const hiddenResult = await removeHiddenContentFromPPTX(currentBuffer, hiddenContentToRemove);
+            currentBuffer = hiddenResult.outBuffer;
+            extraRemovals.hiddenContentRemoved = hiddenResult.stats.removed;
+          }
         }
 
-        // 🆕 Step 4: Remove visual objects (covering shapes)
-        if (visualObjectsToRemove.length > 0) {
-          const visualResult = await removeVisualObjectsFromPPTX(currentBuffer, visualObjectsToRemove);
-          currentBuffer = visualResult.outBuffer;
+        // Step 4: Visual objects (selected only)
+        if (hasSelectiveVisual) {
+          if (visualObjectsToRemove.length > 0) {
+            const visualResult = await removeVisualObjectsFromPPTX(currentBuffer, visualObjectsToRemove);
+            currentBuffer = visualResult.outBuffer;
+          }
         }
 
         // Step 5: Correct spelling
@@ -768,18 +770,28 @@ app.post("/clean", upload.any(), async (req, res) => {
           correctionStats = corrected.stats;
         }
 
-        // AFTER structural stats
+        // AFTER stats
         const documentStatsAfter = await safeExtractDocStats(currentBuffer, ext);
 
         zip.addFile(outName(single, base, "cleaned.pptx"), currentBuffer);
 
-        const afterResult = calculateAfterScore(beforeRiskScore, cleaned.stats, correctionStats, riskBreakdown, extraRemovals);
+        const afterResult = calculateAfterScore(
+          beforeRiskScore,
+          cleaned.stats,
+          correctionStats,
+          riskBreakdown,
+          extraRemovals
+        );
 
         addReportsToZip(zip, single, base, {
           filename: f.originalname,
           ext,
           policy: { drawPolicy, ...cleaningOptions },
-          cleaning: { ...cleaned.stats, sensitiveDataRemoved: extraRemovals.sensitiveDataRemoved, hiddenContentRemoved: extraRemovals.hiddenContentRemoved },
+          cleaning: {
+            ...cleaned.stats,
+            sensitiveDataRemoved: extraRemovals.sensitiveDataRemoved,
+            hiddenContentRemoved: extraRemovals.hiddenContentRemoved,
+          },
           correction: correctionStats,
           analysis: analysisResult,
           spellingErrors,
@@ -791,17 +803,17 @@ app.post("/clean", upload.any(), async (req, res) => {
           documentStatsAfter,
         });
 
-      } else if (ext === "pdf") {
+        continue;
+      }
+
+      // ---------------- PDF ----------------
+      if (ext === "pdf") {
         const cleaned = await cleanPDF(f.buffer, {
           pdfMode: pdfMode === "text-only" ? "text-only" : "sanitize",
-          extractTextFn: async (b) =>
-            filterExtractedLines(await extractPdfText(b), { strictPdf: true }),
+          extractTextFn: async (b) => filterExtractedLines(await extractPdfText(b), { strictPdf: true }),
         });
 
-        zip.addFile(
-          outName(single, base, pdfMode === "text-only" ? "text_only.pdf" : "sanitized.pdf"),
-          cleaned.outBuffer
-        );
+        zip.addFile(outName(single, base, pdfMode === "text-only" ? "text_only.pdf" : "sanitized.pdf"), cleaned.outBuffer);
 
         let correctionStats = null;
         if (includePdfDocx) {
@@ -813,8 +825,7 @@ app.post("/clean", upload.any(), async (req, res) => {
 
           correctionStats = {
             totalTextNodes: 0,
-            changedTextNodes:
-              correctedTxt && filtered ? (correctedTxt.trim() === filtered.trim() ? 0 : 1) : 0,
+            changedTextNodes: correctedTxt && filtered ? (correctedTxt.trim() === filtered.trim() ? 0 : 1) : 0,
             examples:
               correctedTxt && filtered && correctedTxt.trim() !== filtered.trim()
                 ? [{ before: filtered.slice(0, 140), after: correctedTxt.slice(0, 140) }]
@@ -842,18 +853,24 @@ app.post("/clean", upload.any(), async (req, res) => {
           documentStatsAfter,
         });
 
-      } else if (ext === "xlsx") {
+        continue;
+      }
+
+      // ---------------- XLSX ----------------
+      if (ext === "xlsx") {
         let currentBuffer = f.buffer;
 
         // Step 1: Standard cleaning
         const cleaned = await cleanXLSX(currentBuffer, cleaningOptions);
         currentBuffer = cleaned.outBuffer;
 
-        // 🆕 Step 2: Remove sensitive data
-        if (sensitiveDataToRemove.length > 0) {
-          const sensitiveResult = await removeSensitiveDataFromXLSX(currentBuffer, sensitiveDataToRemove);
-          currentBuffer = sensitiveResult.outBuffer;
-          extraRemovals.sensitiveDataRemoved = sensitiveResult.stats.removed;
+        // Step 2: Sensitive (selected only)
+        if (hasSelectiveSensitive) {
+          if (sensitiveDataToRemove.length > 0) {
+            const sensitiveResult = await removeSensitiveDataFromXLSX(currentBuffer, sensitiveDataToRemove);
+            currentBuffer = sensitiveResult.outBuffer;
+            extraRemovals.sensitiveDataRemoved = sensitiveResult.stats.removed;
+          }
         }
 
         // Step 3: Correct spelling
@@ -870,7 +887,13 @@ app.post("/clean", upload.any(), async (req, res) => {
 
         zip.addFile(outName(single, base, "cleaned.xlsx"), currentBuffer);
 
-        const afterResult = calculateAfterScore(beforeRiskScore, cleaned.stats, correctionStats, riskBreakdown, extraRemovals);
+        const afterResult = calculateAfterScore(
+          beforeRiskScore,
+          cleaned.stats,
+          correctionStats,
+          riskBreakdown,
+          extraRemovals
+        );
 
         addReportsToZip(zip, single, base, {
           filename: f.originalname,
@@ -888,31 +911,31 @@ app.post("/clean", upload.any(), async (req, res) => {
           documentStatsAfter,
         });
 
-      } else {
-        zip.addFile(outName(single, base, f.originalname), f.buffer);
-
-        addReportsToZip(zip, single, base, {
-          filename: f.originalname,
-          ext,
-          policy: {},
-          cleaning: {},
-          correction: null,
-          analysis: null,
-          spellingErrors: [],
-          approvedSpellingErrors: [],
-          beforeRiskScore: 100,
-          afterRiskScore: 100,
-          scoreImpacts: {},
-          documentStatsBefore,
-          documentStatsAfter: documentStatsBefore,
-        });
+        continue;
       }
+
+      // ---------------- Other ----------------
+      zip.addFile(outName(single, base, f.originalname), f.buffer);
+
+      addReportsToZip(zip, single, base, {
+        filename: f.originalname,
+        ext,
+        policy: {},
+        cleaning: {},
+        correction: null,
+        analysis: null,
+        spellingErrors: [],
+        approvedSpellingErrors: [],
+        beforeRiskScore: 100,
+        afterRiskScore: 100,
+        scoreImpacts: {},
+        documentStatsBefore,
+        documentStatsAfter: documentStatsBefore,
+      });
     }
 
     const zipName =
-      files.length === 1
-        ? `${baseName(files[0].originalname)} cleaned.zip`
-        : "qualion_doc_cleaned.zip";
+      files.length === 1 ? `${baseName(files[0].originalname)} cleaned.zip` : "qualion_doc_cleaned.zip";
 
     sendZip(res, zip, zipName);
   } catch (e) {
@@ -922,7 +945,7 @@ app.post("/clean", upload.any(), async (req, res) => {
 });
 
 // ===================================================================
-// POST /rephrase - VERSION 2.8.0
+// POST /rephrase - VERSION 2.9.0
 // ===================================================================
 app.post("/rephrase", upload.any(), async (req, res) => {
   try {
@@ -1047,11 +1070,7 @@ app.post("/rephrase", upload.any(), async (req, res) => {
       }
     }
 
-    const zipName =
-      files.length === 1
-        ? `${baseName(files[0].originalname)} rephrased.zip`
-        : "qualion_doc_rephrased.zip";
-
+    const zipName = files.length === 1 ? `${baseName(files[0].originalname)} rephrased.zip` : "qualion_doc_rephrased.zip";
     sendZip(res, zip, zipName);
   } catch (e) {
     console.error("REPHRASE ERROR", e);
@@ -1062,7 +1081,7 @@ app.post("/rephrase", upload.any(), async (req, res) => {
 // ---------- Boot ----------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`✅ Qualion-Doc Backend v2.8.0 listening on port ${PORT}`);
+  console.log(`✅ Qualion-Doc Backend v2.9.0 listening on port ${PORT}`);
   console.log(`   Endpoints: GET /health, POST /analyze, POST /clean, POST /rephrase`);
-  console.log(`   Features: sensitive-data-removal, hidden-content-removal`);
+  console.log(`   Features: selective-cleaning-by-checkbox + docStats fixed`);
 });
