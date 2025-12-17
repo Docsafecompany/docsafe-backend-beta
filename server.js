@@ -1,9 +1,10 @@
-// server.js - VERSION 3.0.0
+// server.js - VERSION 3.0.1
 // ✅ Compatible documentAnalyzer v3.2.2 (documentStats returned by analyzer)
 // ✅ docStats signature fixed (extractDocStats({ ext, buffer }))
 // ✅ Select Items to Clean => REAL removal (selected only when provided)
 // ✅ Robust JSON parsing (string OR already-parsed arrays)
 // ✅ RiskScore includes excelHiddenData (XLSX hidden sheets/rows/cols/formulas)
+// ✅ FIX: selective mode triggers ONLY when lists are NON-EMPTY (prevents "no cleaning" bug)
 // ✅ Keeps backward compatibility (old + new payload shapes)
 
 import express from "express";
@@ -134,11 +135,6 @@ function safeJsonArray(input, fallback = []) {
     console.warn("[JSON PARSE] Failed:", e?.message);
     return fallback;
   }
-}
-
-// Helper: detect if a key was provided (even if empty array)
-function bodyHasKey(req, key) {
-  return Object.prototype.hasOwnProperty.call(req.body || {}, key);
 }
 
 // ============================================================
@@ -373,7 +369,11 @@ function generateRecommendations(detections) {
     recommendations.push(`Review and remove ${detections.comments.length} comment(s) before sharing externally.`);
   if (detections.trackChanges?.length > 0)
     recommendations.push("Accept or reject all tracked changes to finalize the document.");
-  if ((detections.hiddenContent?.length || 0) > 0 || (detections.hiddenSheets?.length || 0) > 0 || (detections.excelHiddenData?.length || 0) > 0)
+  if (
+    (detections.hiddenContent?.length || 0) > 0 ||
+    (detections.hiddenSheets?.length || 0) > 0 ||
+    (detections.excelHiddenData?.length || 0) > 0
+  )
     recommendations.push("Remove hidden content that could expose confidential information.");
   if (detections.macros?.length > 0)
     recommendations.push("Remove macros for security - they can contain executable code.");
@@ -411,7 +411,7 @@ app.get("/health", (_, res) =>
   res.json({
     ok: true,
     service: "Qualion-Doc Backend",
-    version: "3.0.0",
+    version: "3.0.1",
     endpoints: ["/analyze", "/clean", "/rephrase"],
     features: [
       "approvedSpellingErrors",
@@ -426,13 +426,14 @@ app.get("/health", (_, res) =>
       "selective-cleaning-by-checkbox",
       "excelHiddenData-in-risk-score",
       "robust-json-array-parsing",
+      "selective-mode-non-empty-only",
     ],
     time: new Date().toISOString(),
   })
 );
 
 // ===================================================================
-// POST /analyze - VERSION 3.0.0
+// POST /analyze - VERSION 3.0.1
 // ===================================================================
 app.post("/analyze", upload.single("file"), async (req, res) => {
   const startTime = Date.now();
@@ -467,9 +468,10 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
 
     // ✅ We keep docStats as the pipeline reference (and use analyzer docStats only as fallback)
     const docStats = await safeExtractDocStats(req.file.buffer, ext);
-    const documentStats = docStats && (docStats.pages || docStats.slides || docStats.sheets || docStats.tables)
-      ? docStats
-      : (analysisResult.documentStats || docStats);
+    const documentStats =
+      docStats && (docStats.pages || docStats.slides || docStats.sheets || docStats.tables)
+        ? docStats
+        : analysisResult.documentStats || docStats;
 
     res.json({
       documentId: uuidv4(),
@@ -515,7 +517,8 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
 });
 
 // ===================================================================
-// POST /clean - VERSION 3.0.0
+// POST /clean - VERSION 3.0.1
+// ✅ FIX: selective mode triggers ONLY when list is NON-EMPTY
 // ===================================================================
 app.post("/clean", upload.any(), async (req, res) => {
   try {
@@ -539,26 +542,23 @@ app.post("/clean", upload.any(), async (req, res) => {
     // ✅ approved spelling errors (string or array)
     const approvedSpellingErrors = safeJsonArray(req.body.approvedSpellingErrors, []);
 
-    // ✅ Detect if front is sending selective lists (even empty)
-    const hasSelectiveSensitive =
-      bodyHasKey(req, "sensitiveDataToClean") || bodyHasKey(req, "removeSensitiveData");
-    const hasSelectiveHidden =
-      bodyHasKey(req, "hiddenContentToClean") || bodyHasKey(req, "hiddenContentToCleanRaw");
-    const hasSelectiveVisual = bodyHasKey(req, "visualObjectsToClean");
-
     // ✅ Accept BOTH payload shapes from frontend (old + new)
-    // removeSensitiveData can be [] / ["id"] / [{...}]
     const removeSensitiveDataRaw =
       safeJsonArray(req.body.removeSensitiveData, null) ?? safeJsonArray(req.body.sensitiveDataToClean, []);
 
     const hiddenContentToCleanRaw = safeJsonArray(req.body.hiddenContentToClean, []);
     const visualObjectsToCleanRaw = safeJsonArray(req.body.visualObjectsToClean, []);
 
+    // ✅ Selective mode should ONLY activate when list is NON-EMPTY
+    const hasSelectiveSensitive = Array.isArray(removeSensitiveDataRaw) && removeSensitiveDataRaw.length > 0;
+    const hasSelectiveHidden = Array.isArray(hiddenContentToCleanRaw) && hiddenContentToCleanRaw.length > 0;
+    const hasSelectiveVisual = Array.isArray(visualObjectsToCleanRaw) && visualObjectsToCleanRaw.length > 0;
+
     console.log(`[CLEAN] removeSensitiveData raw count: ${removeSensitiveDataRaw?.length || 0}`);
     console.log(`[CLEAN] hiddenContentToClean raw count: ${hiddenContentToCleanRaw?.length || 0}`);
     console.log(`[CLEAN] visualObjectsToClean raw count: ${visualObjectsToCleanRaw?.length || 0}`);
     console.log(
-      `[CLEAN] Selective modes: sensitive=${hasSelectiveSensitive}, hidden=${hasSelectiveHidden}, visual=${hasSelectiveVisual}`
+      `[CLEAN] Selective modes (NON-empty lists): sensitive=${hasSelectiveSensitive}, hidden=${hasSelectiveHidden}, visual=${hasSelectiveVisual}`
     );
 
     const single = files.length === 1;
@@ -619,7 +619,7 @@ app.post("/clean", upload.any(), async (req, res) => {
 
       // Map selection -> full objects
       let sensitiveDataToRemove = [];
-      if ((removeSensitiveDataRaw?.length || 0) > 0 && detections?.sensitiveData) {
+      if (hasSelectiveSensitive && detections?.sensitiveData) {
         if (typeof removeSensitiveDataRaw[0] === "string") {
           sensitiveDataToRemove = detections.sensitiveData.filter((d) => removeSensitiveDataRaw.includes(d.id));
         } else {
@@ -628,7 +628,7 @@ app.post("/clean", upload.any(), async (req, res) => {
       }
 
       let hiddenContentToRemove = [];
-      if ((hiddenContentToCleanRaw?.length || 0) > 0 && detections?.hiddenContent) {
+      if (hasSelectiveHidden && detections?.hiddenContent) {
         if (typeof hiddenContentToCleanRaw[0] === "string") {
           hiddenContentToRemove = detections.hiddenContent.filter((d) => hiddenContentToCleanRaw.includes(d.id));
         } else {
@@ -637,7 +637,7 @@ app.post("/clean", upload.any(), async (req, res) => {
       }
 
       let visualObjectsToRemove = [];
-      if ((visualObjectsToCleanRaw?.length || 0) > 0 && detections?.visualObjects) {
+      if (hasSelectiveVisual && detections?.visualObjects) {
         if (typeof visualObjectsToCleanRaw[0] === "string") {
           visualObjectsToRemove = detections.visualObjects.filter((d) => visualObjectsToCleanRaw.includes(d.id));
         } else {
@@ -904,7 +904,7 @@ app.post("/clean", upload.any(), async (req, res) => {
 });
 
 // ===================================================================
-// POST /rephrase - VERSION 3.0.0
+// POST /rephrase - VERSION 3.0.1
 // ===================================================================
 app.post("/rephrase", upload.any(), async (req, res) => {
   try {
@@ -1040,7 +1040,7 @@ app.post("/rephrase", upload.any(), async (req, res) => {
 // ---------- Boot ----------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`✅ Qualion-Doc Backend v3.0.0 listening on port ${PORT}`);
+  console.log(`✅ Qualion-Doc Backend v3.0.1 listening on port ${PORT}`);
   console.log(`   Endpoints: GET /health, POST /analyze, POST /clean, POST /rephrase`);
-  console.log(`   Features: robust-json + excelHiddenData risk + docStats fixed`);
+  console.log(`   Features: robust-json + excelHiddenData risk + docStats fixed + selective(non-empty)`);
 });
