@@ -1,8 +1,8 @@
-// server.js - VERSION 3.1.0
-// ✅ Compatible documentAnalyzer v3.2.2
-// ✅ Adds Universal Risk Model (4 surfaces) => riskObjects[] + riskSummary (Client-Ready gate)
-// ✅ Does NOT break existing detections/summary payloads
-// ✅ Keeps selective cleaning behavior (non-empty lists only)
+// server.js - VERSION 3.2.0
+// ✅ Compatible documentAnalyzer (keeps existing detections + summary payloads)
+// ✅ Adds Qualion Part 2: Business Risk (5 categories) using deterministic rules
+// ✅ Keeps Universal Risk Model (riskObjects[] + riskSummary)
+// ✅ Non-breaking: existing keys remain, new key: qualionReport + businessSignals
 
 import express from "express";
 import cors from "cors";
@@ -173,7 +173,6 @@ function calculateRiskScore(summary, detections = null) {
       breakdown.macros = penalty;
     }
 
-    // ✅ include excelHiddenData in hidden penalty (XLSX)
     const hiddenCount =
       (detections.hiddenContent?.length || 0) +
       (detections.hiddenSheets?.length || 0) +
@@ -257,7 +256,7 @@ function calculateRiskScore(summary, detections = null) {
 }
 
 // ============================================================
-// Universal Risk Model (NEW) - 4 Surfaces + 4 Executive Categories
+// Universal Risk Model (kept) + Qualion Business Risk V1 (NEW)
 // ============================================================
 
 // 4 Exposure Surfaces
@@ -268,12 +267,21 @@ const SURFACE = {
   METADATA: "metadata",
 };
 
-// 4 Executive Risk Categories
+// 5 Business Risk Categories (Qualion Part 2)
 const EXEC_CAT = {
   MARGIN: "margin",
   DELIVERY: "delivery",
   NEGOTIATION: "negotiation",
+  COMPLIANCE: "compliance",
   CREDIBILITY: "credibility",
+};
+
+const EXEC_CAT_LABEL = {
+  margin: "Margin Exposure Risk",
+  delivery: "Delivery & Commitment Risk",
+  negotiation: "Negotiation Power Leakage",
+  compliance: "Compliance & Confidentiality Risk",
+  credibility: "Professional Credibility Risk",
 };
 
 function normalizeSeverity(sev) {
@@ -287,20 +295,14 @@ function severityRank(sev) {
   return s === "critical" ? 4 : s === "high" ? 3 : s === "medium" ? 2 : 1;
 }
 
-// Simple deterministic points (per spec)
+// Simple deterministic points
 function pointsForRiskObject(ro) {
   let pts = 0;
 
-  // Hidden but accessible
   if (ro.surface === SURFACE.HIDDEN) pts += 3;
-
-  // Generated/derived logic
   if (ro.surface === SURFACE.LOGIC) pts += 2;
-
-  // Metadata revealing intent/org
   if (ro.surface === SURFACE.METADATA) pts += 2;
 
-  // Cross-object dependency hint (best-effort based on detection types)
   if (ro.ruleId === "XLSX_FORMULA" || ro.ruleId === "XLSX_EXTERNAL_REF" || ro.ruleId === "BROKEN_LINK") pts += 2;
 
   // Financial proximity
@@ -309,22 +311,238 @@ function pointsForRiskObject(ro) {
   return pts;
 }
 
-// Map detection-type => executive category (deterministic)
-function categorizeDetection(detType) {
+// Deterministic mapping for sensitive data types -> business category
+function categorizeSensitiveType(detType) {
   const t = String(detType || "").toLowerCase();
 
-  // explicit financial signals
-  if (["price", "iban", "credit_card"].includes(t)) return EXEC_CAT.MARGIN;
+  // Margin exposure identifiers
+  if (["price", "rate", "rate_card", "iban", "credit_card"].includes(t)) return EXEC_CAT.MARGIN;
 
-  // strong negotiation leakage candidates
+  // Negotiation leakage / internal posture
   if (["project_code", "internal_url", "file_path", "server_path", "ip_address"].includes(t)) return EXEC_CAT.NEGOTIATION;
 
-  // personal data is more "negotiation/credibility" (client trust / compliance)
-  if (["email", "phone", "ssn"].includes(t)) return EXEC_CAT.CREDIBILITY;
+  // Compliance & confidentiality identifiers
+  if (["email", "phone", "ssn", "pii", "personal_data"].includes(t)) return EXEC_CAT.COMPLIANCE;
 
   return EXEC_CAT.CREDIBILITY;
 }
 
+/**
+ * NEW: Deterministic business flags feeding Part 2.
+ * This is where you extend rules later (especially DELIVERY).
+ */
+function deriveBusinessSignals(ext, detections = {}) {
+  const signals = [];
+
+  const push = (s) =>
+    signals.push({
+      id: s.id || `bs_${uuidv4()}`,
+      category: s.category,          // margin|delivery|negotiation|compliance|credibility
+      severity: normalizeSeverity(s.severity || "low"),
+      ruleId: s.ruleId,              // stable string
+      signalFamily: s.signalFamily,  // stable family key (for analytics)
+      reason: s.reason,              // neutral executive framing (no intent)
+      location: s.location || "Document",
+      source: s.source || null,
+    });
+
+  // ---- Margin exposure (XLSX / pricing logic)
+  (detections.sensitiveFormulas || []).forEach((f) => {
+    push({
+      category: EXEC_CAT.MARGIN,
+      severity: f.severity || f.risk || "medium",
+      ruleId: "MARGIN_FORMULA_OR_LOGIC",
+      signalFamily: "pricing_calculation_artifacts",
+      reason: "Spreadsheet formulas detected that could reveal pricing logic.",
+      location: f.sheet ? `Sheet: ${f.sheet}` : "Workbook",
+      source: { group: "sensitiveFormulas", id: f.id || null },
+    });
+  });
+
+  (detections.hiddenSheets || []).forEach((hs) => {
+    push({
+      category: EXEC_CAT.MARGIN,
+      severity: hs.severity || "high",
+      ruleId: "MARGIN_HIDDEN_SHEET",
+      signalFamily: "pricing_structure_signals",
+      reason: "Hidden worksheets detected that may contain pricing or cost structures.",
+      location: hs.sheetName ? `Sheet: ${hs.sheetName}` : "Workbook",
+      source: { group: "hiddenSheets", id: hs.id || null },
+    });
+  });
+
+  (detections.excelHiddenData || []).forEach((x) => {
+    const type = String(x.type || "").toLowerCase();
+    const isFormula = type.includes("formula");
+
+    push({
+      category: EXEC_CAT.MARGIN,
+      severity: x.severity || (isFormula ? "high" : "medium"),
+      ruleId: isFormula ? "MARGIN_HIDDEN_FORMULA" : "MARGIN_HIDDEN_DATA",
+      signalFamily: isFormula ? "pricing_calculation_artifacts" : "pricing_structure_signals",
+      reason: isFormula
+        ? "Hidden spreadsheet logic detected that could reveal pricing assumptions."
+        : "Hidden spreadsheet data detected that may expose internal cost or pricing elements.",
+      location: x.location || "Workbook",
+      source: { group: "excelHiddenData", id: x.id || null },
+    });
+  });
+
+  // ---- Negotiation leakage (metadata, hidden content, embedded objects, internal traces)
+  (detections.metadata || []).forEach((m) => {
+    push({
+      category: EXEC_CAT.NEGOTIATION,
+      severity: m.severity || "medium",
+      ruleId: "NEGOTIATION_METADATA",
+      signalFamily: "traceability_artifacts",
+      reason: "Metadata detected that may reveal internal authorship or organization context.",
+      location: m.location || "Document Properties",
+      source: { group: "metadata", id: m.id || null },
+    });
+  });
+
+  (detections.hiddenContent || []).forEach((h) => {
+    push({
+      category: EXEC_CAT.NEGOTIATION,
+      severity: h.severity || "high",
+      ruleId: "NEGOTIATION_HIDDEN_CONTENT",
+      signalFamily: "internal_assumption_signals",
+      reason: "Hidden content detected that may expose internal assumptions.",
+      location: h.location || "Document",
+      source: { group: "hiddenContent", id: h.id || null },
+    });
+  });
+
+  (detections.embeddedObjects || []).forEach((e) => {
+    push({
+      category: EXEC_CAT.NEGOTIATION,
+      severity: e.severity || "medium",
+      ruleId: "NEGOTIATION_EMBEDDED_OBJECT",
+      signalFamily: "traceability_artifacts",
+      reason: "Embedded objects detected that may contain additional internal data.",
+      location: e.path || "Document",
+      source: { group: "embeddedObjects", id: e.id || null },
+    });
+  });
+
+  // ---- Compliance & confidentiality (explicit compliance risks + PII-like sensitive data)
+  (detections.complianceRisks || []).forEach((c) => {
+    push({
+      category: EXEC_CAT.COMPLIANCE,
+      severity: c.severity || "high",
+      ruleId: "COMPLIANCE_SIGNAL",
+      signalFamily: "identifier_exposure_signals",
+      reason: "Confidential or regulated identifiers detected in a client-facing document.",
+      location: c.location || "Document",
+      source: { group: "complianceRisks", id: c.id || null },
+    });
+  });
+
+  (detections.sensitiveData || []).forEach((s) => {
+    const cat = categorizeSensitiveType(s.type);
+
+    // Only route to compliance when applicable; otherwise negotiation/margin/credibility
+    push({
+      category: cat,
+      severity: s.severity || "high",
+      ruleId: "VISIBLE_SENSITIVE",
+      signalFamily: cat === EXEC_CAT.COMPLIANCE ? "identifier_exposure_signals" : "client_facing_exposure",
+      reason:
+        cat === EXEC_CAT.COMPLIANCE
+          ? "Sensitive identifiers detected in a client-facing document."
+          : "Sensitive information detected that may not be necessary for client understanding.",
+      location: s.location || "Document",
+      source: { group: "sensitiveData", id: s.id || null, type: s.type || null },
+    });
+  });
+
+  // ---- Professional credibility (comments, track changes, spelling, formatting artifacts)
+  (detections.comments || []).forEach((c) => {
+    push({
+      category: EXEC_CAT.CREDIBILITY,
+      severity: c.severity || "medium",
+      ruleId: c.type === "tracked_change" ? "CRED_TRACKED_CHANGE" : "CRED_COMMENT",
+      signalFamily: "draft_artifact_signals",
+      reason:
+        c.type === "tracked_change"
+          ? "Tracked changes detected that may expose draft edits or internal review."
+          : "Comments detected that may expose internal review discussions.",
+      location: c.location || "Document",
+      source: { group: "comments", id: c.id || null },
+    });
+  });
+
+  (detections.trackChanges || []).forEach((tc) => {
+    push({
+      category: EXEC_CAT.CREDIBILITY,
+      severity: tc.severity || "medium",
+      ruleId: "CRED_TRACKED_CHANGE",
+      signalFamily: "draft_artifact_signals",
+      reason: "Tracked changes detected that may expose draft edits or internal review.",
+      location: tc.location || "Document",
+      source: { group: "trackChanges", id: tc.id || null },
+    });
+  });
+
+  (detections.spellingErrors || []).forEach((sp) => {
+    push({
+      category: EXEC_CAT.CREDIBILITY,
+      severity: sp.severity || "low",
+      ruleId: "CRED_SPELLING",
+      signalFamily: "formatting_consistency_issues",
+      reason: "Spelling or grammar issues detected that may affect professional credibility.",
+      location: sp.location || "Document",
+      source: { group: "spellingErrors", id: sp.id || null },
+    });
+  });
+
+  (detections.orphanData || []).forEach((o) => {
+    push({
+      category: EXEC_CAT.CREDIBILITY,
+      severity: o.severity || "low",
+      ruleId: "CRED_FORMATTING_ARTIFACT",
+      signalFamily: "formatting_consistency_issues",
+      reason: "Residual formatting artifacts detected that may require a quick review.",
+      location: o.location || "Document",
+      source: { group: "orphanData", id: o.id || null },
+    });
+  });
+
+  // ---- Delivery & commitment (PLACEHOLDER deterministic mapping)
+  // NOTE: Your analyzer currently doesn't output explicit delivery-language detections.
+  // If businessInconsistencies has commitment-related entries, map them here deterministically.
+  (detections.businessInconsistencies || []).forEach((b) => {
+    const t = String(b.type || b.key || "").toLowerCase();
+    const hint = String(b.reason || b.message || "").toLowerCase();
+
+    const looksDelivery =
+      t.includes("commit") ||
+      t.includes("delivery") ||
+      t.includes("deadline") ||
+      t.includes("scope") ||
+      hint.includes("commit") ||
+      hint.includes("deadline") ||
+      hint.includes("scope");
+
+    if (!looksDelivery) return;
+
+    push({
+      category: EXEC_CAT.DELIVERY,
+      severity: b.severity || "medium",
+      ruleId: "DELIVERY_COMMITMENT_SIGNAL",
+      signalFamily: "engagement_language_signals",
+      reason: "Commitment language detected without clear delivery boundaries.",
+      location: b.location || "Document",
+      source: { group: "businessInconsistencies", id: b.id || null },
+    });
+  });
+
+  return signals;
+}
+
+/**
+ * Kept: mapDetectionsToRiskObjects (Universal model) - now updated to 5 cats where appropriate.
+ */
 function mapDetectionsToRiskObjects(fileType, detections) {
   const riskObjects = [];
   const ext = String(fileType || "").toLowerCase();
@@ -332,20 +550,20 @@ function mapDetectionsToRiskObjects(fileType, detections) {
   const pushRO = (ro) => {
     riskObjects.push({
       id: ro.id || `ro_${uuidv4()}`,
-      surface: ro.surface, // visible|hidden|logic|metadata
-      category: ro.category, // margin|delivery|negotiation|credibility
+      surface: ro.surface,
+      category: ro.category, // margin|delivery|negotiation|compliance|credibility
       severity: normalizeSeverity(ro.severity),
       fileType: ext,
-      ruleId: ro.ruleId, // deterministic string
-      reason: ro.reason, // short neutral sentence
+      ruleId: ro.ruleId,
+      reason: ro.reason,
       location: ro.location || "Document",
-      fixability: ro.fixability || "manual", // auto-fix|manual|not-fixable
-      source: ro.source || null, // { detectionGroup, detectionId }
+      fixability: ro.fixability || "manual",
+      source: ro.source || null,
       meta: ro.meta || {},
     });
   };
 
-  // ---------------- METADATA => surface: metadata
+  // METADATA => negotiation surface: metadata
   (detections.metadata || []).forEach((m) => {
     pushRO({
       id: `ro_meta_${m.id || uuidv4()}`,
@@ -361,7 +579,7 @@ function mapDetectionsToRiskObjects(fileType, detections) {
     });
   });
 
-  // ---------------- COMMENTS => hidden
+  // COMMENTS => hidden => credibility
   (detections.comments || []).forEach((c) => {
     pushRO({
       id: `ro_comment_${c.id || uuidv4()}`,
@@ -380,7 +598,7 @@ function mapDetectionsToRiskObjects(fileType, detections) {
     });
   });
 
-  // ---------------- TRACK CHANGES (legacy group) => hidden
+  // TRACK CHANGES => hidden => credibility
   (detections.trackChanges || []).forEach((tc) => {
     pushRO({
       id: `ro_tc_${tc.id || uuidv4()}`,
@@ -396,7 +614,7 @@ function mapDetectionsToRiskObjects(fileType, detections) {
     });
   });
 
-  // ---------------- HIDDEN CONTENT => hidden
+  // HIDDEN CONTENT => hidden => negotiation
   (detections.hiddenContent || []).forEach((h) => {
     pushRO({
       id: `ro_hidden_${h.id || uuidv4()}`,
@@ -412,7 +630,7 @@ function mapDetectionsToRiskObjects(fileType, detections) {
     });
   });
 
-  // ---------------- XLSX HIDDEN SHEETS (legacy group) => hidden
+  // XLSX HIDDEN SHEETS => hidden => margin
   (detections.hiddenSheets || []).forEach((hs) => {
     pushRO({
       id: `ro_hidden_sheet_${hs.id || uuidv4()}`,
@@ -428,7 +646,7 @@ function mapDetectionsToRiskObjects(fileType, detections) {
     });
   });
 
-  // ---------------- XLSX FORMULAS (legacy group) => logic
+  // XLSX FORMULAS => logic => margin
   (detections.sensitiveFormulas || []).forEach((f) => {
     pushRO({
       id: `ro_formula_${f.id || uuidv4()}`,
@@ -444,14 +662,14 @@ function mapDetectionsToRiskObjects(fileType, detections) {
     });
   });
 
-  // ---------------- XLSX consolidated excelHiddenData => hidden/logic
+  // XLSX excelHiddenData => hidden/logic => margin
   (detections.excelHiddenData || []).forEach((x) => {
     const type = String(x.type || "").toLowerCase();
     const isFormula = type.includes("formula");
     pushRO({
       id: `ro_excelhidden_${x.id || uuidv4()}`,
       surface: isFormula ? SURFACE.LOGIC : SURFACE.HIDDEN,
-      category: isFormula ? EXEC_CAT.MARGIN : EXEC_CAT.MARGIN,
+      category: EXEC_CAT.MARGIN,
       severity: x.severity || "high",
       ruleId: isFormula ? "XLSX_FORMULA" : "XLSX_HIDDEN_DATA",
       reason: isFormula
@@ -464,7 +682,7 @@ function mapDetectionsToRiskObjects(fileType, detections) {
     });
   });
 
-  // ---------------- EMBEDDED OBJECTS => logic (cross-object)
+  // EMBEDDED OBJECTS => logic => negotiation
   (detections.embeddedObjects || []).forEach((e) => {
     pushRO({
       id: `ro_embed_${e.id || uuidv4()}`,
@@ -480,7 +698,7 @@ function mapDetectionsToRiskObjects(fileType, detections) {
     });
   });
 
-  // ---------------- MACROS => logic (critical)
+  // MACROS => logic => credibility (trust)
   (detections.macros || []).forEach((m) => {
     pushRO({
       id: `ro_macro_${m.id || uuidv4()}`,
@@ -496,16 +714,19 @@ function mapDetectionsToRiskObjects(fileType, detections) {
     });
   });
 
-  // ---------------- SENSITIVE DATA => visible
+  // SENSITIVE DATA => visible => compliance/negotiation/margin/credibility (deterministic)
   (detections.sensitiveData || []).forEach((s) => {
-    const cat = categorizeDetection(s.type);
+    const cat = categorizeSensitiveType(s.type);
     pushRO({
       id: `ro_sensitive_${s.id || uuidv4()}`,
       surface: SURFACE.VISIBLE,
-      category: cat === EXEC_CAT.CREDIBILITY ? EXEC_CAT.NEGOTIATION : cat, // pragmatic default
+      category: cat,
       severity: s.severity || "high",
       ruleId: "VISIBLE_SENSITIVE",
-      reason: "Visible sensitive information detected that may not be necessary for client understanding.",
+      reason:
+        cat === EXEC_CAT.COMPLIANCE
+          ? "Sensitive identifiers detected in a client-facing document."
+          : "Visible sensitive information detected that may not be necessary for client understanding.",
       location: s.location || "Document",
       fixability: "manual",
       source: { detectionGroup: "sensitiveData", detectionId: s.id || null },
@@ -513,7 +734,7 @@ function mapDetectionsToRiskObjects(fileType, detections) {
     });
   });
 
-  // ---------------- SPELLING / DRAFT signals => credibility
+  // SPELLING => credibility
   (detections.spellingErrors || []).forEach((sp) => {
     pushRO({
       id: `ro_spell_${sp.id || uuidv4()}`,
@@ -529,7 +750,7 @@ function mapDetectionsToRiskObjects(fileType, detections) {
     });
   });
 
-  // ---------------- BROKEN LINKS => logic (dependency risk)
+  // BROKEN LINKS => credibility
   (detections.brokenLinks || []).forEach((b) => {
     pushRO({
       id: `ro_link_${b.id || uuidv4()}`,
@@ -545,15 +766,15 @@ function mapDetectionsToRiskObjects(fileType, detections) {
     });
   });
 
-  // ---------------- COMPLIANCE RISKS => credibility
+  // COMPLIANCE RISKS => compliance
   (detections.complianceRisks || []).forEach((c) => {
     pushRO({
       id: `ro_compliance_${c.id || uuidv4()}`,
       surface: SURFACE.VISIBLE,
-      category: EXEC_CAT.CREDIBILITY,
+      category: EXEC_CAT.COMPLIANCE,
       severity: c.severity || "high",
       ruleId: "COMPLIANCE_SIGNAL",
-      reason: "Compliance-related signals detected that require review before external sharing.",
+      reason: "Compliance or confidentiality signals detected that require review before external sharing.",
       location: c.location || "Document",
       fixability: "manual",
       source: { detectionGroup: "complianceRisks", detectionId: c.id || null },
@@ -561,7 +782,7 @@ function mapDetectionsToRiskObjects(fileType, detections) {
     });
   });
 
-  // ---------------- VISUAL OBJECTS (PPT shapes/textboxes etc.) => hidden/visible mix; we tag hidden if "covering" or missing alt
+  // VISUAL OBJECTS => credibility
   (detections.visualObjects || []).forEach((v) => {
     const t = String(v.type || "").toLowerCase();
     const surface = t.includes("cover") ? SURFACE.HIDDEN : SURFACE.VISIBLE;
@@ -583,7 +804,7 @@ function mapDetectionsToRiskObjects(fileType, detections) {
     });
   });
 
-  // ---------------- ORPHAN DATA => credibility (low)
+  // ORPHAN DATA => credibility
   (detections.orphanData || []).forEach((o) => {
     pushRO({
       id: `ro_orphan_${o.id || uuidv4()}`,
@@ -599,8 +820,7 @@ function mapDetectionsToRiskObjects(fileType, detections) {
     });
   });
 
-  // Delivery category (best effort)
-  // If you later add explicit detections for delivery/commitment language, map them here.
+  // DELIVERY is handled through businessSignals for now (until analyzer emits explicit delivery detections)
 
   return riskObjects;
 }
@@ -610,11 +830,11 @@ function summarizeRiskObjects(riskObjects) {
     [EXEC_CAT.MARGIN]: { points: 0, count: 0, maxSeverity: "low" },
     [EXEC_CAT.DELIVERY]: { points: 0, count: 0, maxSeverity: "low" },
     [EXEC_CAT.NEGOTIATION]: { points: 0, count: 0, maxSeverity: "low" },
+    [EXEC_CAT.COMPLIANCE]: { points: 0, count: 0, maxSeverity: "low" },
     [EXEC_CAT.CREDIBILITY]: { points: 0, count: 0, maxSeverity: "low" },
   };
 
   let anyCritical = false;
-  let maxOverallRank = 1;
 
   for (const ro of riskObjects) {
     const cat = ro.category || EXEC_CAT.CREDIBILITY;
@@ -627,14 +847,13 @@ function summarizeRiskObjects(riskObjects) {
 
     const r = severityRank(sev);
     if (r > severityRank(byCategory[cat].maxSeverity)) byCategory[cat].maxSeverity = sev;
-    if (r > maxOverallRank) maxOverallRank = r;
   }
 
   const categorySeverityFromPoints = (pts, maxSev) => {
-    // Thresholds per spec (0–3 low, 4–6 medium, 7+ high/critical)
     if (maxSev === "critical") return "critical";
     if (pts >= 7) return "high";
     if (pts >= 4) return "medium";
+    if (pts > 0) return "low";
     return "low";
   };
 
@@ -660,14 +879,13 @@ function summarizeRiskObjects(riskObjects) {
     }
   }
 
-  // Executive signals (only the 4 labels, no internals)
   const executiveSignals = [];
-  if (perCat[EXEC_CAT.MARGIN].points > 0) executiveSignals.push("Margin Exposure");
-  if (perCat[EXEC_CAT.DELIVERY].points > 0) executiveSignals.push("Delivery & Commitment Risk");
-  if (perCat[EXEC_CAT.NEGOTIATION].points > 0) executiveSignals.push("Negotiation Leakage");
-  if (perCat[EXEC_CAT.CREDIBILITY].points > 0) executiveSignals.push("Professional Credibility Risk");
+  if (perCat[EXEC_CAT.MARGIN].points > 0) executiveSignals.push(EXEC_CAT_LABEL.margin);
+  if (perCat[EXEC_CAT.DELIVERY].points > 0) executiveSignals.push(EXEC_CAT_LABEL.delivery);
+  if (perCat[EXEC_CAT.NEGOTIATION].points > 0) executiveSignals.push(EXEC_CAT_LABEL.negotiation);
+  if (perCat[EXEC_CAT.COMPLIANCE].points > 0) executiveSignals.push(EXEC_CAT_LABEL.compliance);
+  if (perCat[EXEC_CAT.CREDIBILITY].points > 0) executiveSignals.push(EXEC_CAT_LABEL.credibility);
 
-  // Blocking issues list: high/critical first (short neutral sentence)
   const blocking = riskObjects
     .filter((ro) => ["high", "critical"].includes(normalizeSeverity(ro.severity)))
     .sort((a, b) => severityRank(b.severity) - severityRank(a.severity))
@@ -683,12 +901,11 @@ function summarizeRiskObjects(riskObjects) {
       ruleId: ro.ruleId,
     }));
 
-  // Client-Ready gate
-  // Spec: any critical => NO. Also if any category points >= 7 => NO (High).
   const anyHighCategory =
     perCat[EXEC_CAT.MARGIN].points >= 7 ||
     perCat[EXEC_CAT.DELIVERY].points >= 7 ||
     perCat[EXEC_CAT.NEGOTIATION].points >= 7 ||
+    perCat[EXEC_CAT.COMPLIANCE].points >= 7 ||
     perCat[EXEC_CAT.CREDIBILITY].points >= 7;
 
   const clientReady = anyCritical || anyHighCategory ? "NO" : "YES";
@@ -710,10 +927,149 @@ function summarizeRiskObjects(riskObjects) {
       margin: perCat[EXEC_CAT.MARGIN],
       delivery: perCat[EXEC_CAT.DELIVERY],
       negotiation: perCat[EXEC_CAT.NEGOTIATION],
+      compliance: perCat[EXEC_CAT.COMPLIANCE],
       credibility: perCat[EXEC_CAT.CREDIBILITY],
     },
     blockingIssues: blocking,
     totalRiskObjects: riskObjects.length,
+  };
+}
+
+// ---------------- Qualion Report (Part 1 + Part 2) ----------------
+
+function buildPart1Checklist(detections = {}) {
+  const has = (arr) => Array.isArray(arr) && arr.length > 0;
+
+  return [
+    {
+      key: "hidden_content",
+      present: has(detections.hiddenContent) || has(detections.hiddenSheets) || has(detections.excelHiddenData),
+      label: "Hidden content detected in client-facing document",
+    },
+    {
+      key: "comments_present",
+      present: has(detections.comments),
+      label: "Internal comments present",
+    },
+    {
+      key: "track_changes_detected",
+      present: has(detections.trackChanges),
+      label: "Track changes detected",
+    },
+    {
+      key: "metadata_exposure",
+      present: has(detections.metadata),
+      label: "Metadata revealing internal context detected",
+    },
+    {
+      key: "embedded_objects",
+      present: has(detections.embeddedObjects),
+      label: "Embedded objects or attachments detected",
+    },
+    {
+      key: "structural_hidden_elements",
+      present: has(detections.hiddenSheets) || has(detections.visualObjects),
+      label: "Structural issues detected (hidden slides, sheets, layers)",
+    },
+    {
+      key: "formatting_anomalies",
+      present: has(detections.orphanData) || has(detections.visualObjects),
+      label: "Formatting anomalies or draft artifacts detected",
+    },
+  ];
+}
+
+function riskLevelFromSeverityLabel(s) {
+  const v = String(s || "").toLowerCase();
+  if (v === "critical" || v === "high") return "High";
+  if (v === "medium") return "Medium";
+  if (v === "low") return "Low";
+  return "None";
+}
+
+function buildBusinessCategoryOutput(catKey, businessSignals, riskSummary) {
+  // Risk level comes from riskSummary severity by category
+  const sev = riskSummary?.byCategory?.[catKey]?.severity || "low";
+  const level = riskLevelFromSeverityLabel(sev);
+
+  // Key drivers from businessSignals (signalFamily)
+  const drivers = Array.from(
+    new Set(
+      (businessSignals || [])
+        .filter((s) => s.category === catKey)
+        .map((s) => s.signalFamily || s.ruleId)
+    )
+  ).slice(0, 5);
+
+  const sentences = [];
+  if (level === "None") {
+    sentences.push("No client-facing business risk signals detected in this category.");
+  } else {
+    sentences.push(
+      level === "High"
+        ? "High-risk signals detected that may increase exposure if the document is sent externally."
+        : "Signals detected that may increase exposure if the document is sent externally."
+    );
+    sentences.push("Signals are derived from deterministic hygiene, structure, and identifier checks.");
+    if (drivers.length) sentences.push(`Key indicators: ${drivers.slice(0, 3).join("; ")}.`);
+  }
+
+  return {
+    category: catKey,
+    title: EXEC_CAT_LABEL[catKey],
+    riskLevel: level, // None / Low / Medium / High
+    summary: sentences.slice(0, 3),
+  };
+}
+
+function computeBusinessRecommendation(clientReady, overallSeverityLabel) {
+  const sev = String(overallSeverityLabel || "").toLowerCase();
+
+  if (clientReady === "NO") {
+    return "Review flagged business risk items before external sharing, then re-run Qualion Clean.";
+  }
+  if (sev === "medium") {
+    return "Consider reviewing highlighted items to reduce exposure before external sharing.";
+  }
+  return "No blocking business risks detected. Document is suitable for client-facing export.";
+}
+
+function buildQualionReport({ documentId, fileName, ext, detections, riskObjects, riskSummary, businessSignals }) {
+  const part1 = {
+    title: "Technical & Content Hygiene Report",
+    checklist: buildPart1Checklist(detections || {}),
+  };
+
+  const part2 = {
+    title: "Business Risk Report",
+    collapsedByDefault: true,
+    clientReady: riskSummary?.clientReady || "YES",
+    overallSeverity: riskSummary?.overallSeverity || "Low",
+    categories: [
+      buildBusinessCategoryOutput("margin", businessSignals, riskSummary),
+      buildBusinessCategoryOutput("delivery", businessSignals, riskSummary),
+      buildBusinessCategoryOutput("negotiation", businessSignals, riskSummary),
+      buildBusinessCategoryOutput("compliance", businessSignals, riskSummary),
+      buildBusinessCategoryOutput("credibility", businessSignals, riskSummary),
+    ],
+    recommendation: computeBusinessRecommendation(riskSummary?.clientReady || "YES", riskSummary?.overallSeverity || "Low"),
+  };
+
+  return {
+    meta: {
+      documentId,
+      fileName,
+      fileType: ext,
+      analyzedAt: new Date().toISOString(),
+      version: "v1",
+    },
+    part1,
+    part2,
+    // keep internal helpers if you want to debug; front can ignore
+    internal: {
+      businessSignalsCount: businessSignals?.length || 0,
+      riskObjectsCount: riskObjects?.length || 0,
+    },
   };
 }
 
@@ -865,7 +1221,7 @@ app.get("/health", (_, res) =>
   res.json({
     ok: true,
     service: "Qualion-Doc Backend",
-    version: "3.1.0",
+    version: "3.2.0",
     endpoints: ["/analyze", "/clean", "/rephrase"],
     features: [
       "approvedSpellingErrors",
@@ -883,13 +1239,16 @@ app.get("/health", (_, res) =>
       "selective-mode-non-empty-only",
       "universal-riskObjects-4-surfaces",
       "client-ready-gate",
+      "qualion-report-part1-part2",
+      "business-risk-5-categories",
+      "deterministic-business-signals",
     ],
     time: new Date().toISOString(),
   })
 );
 
 // ===================================================================
-// POST /analyze - VERSION 3.1.0
+// POST /analyze - VERSION 3.2.0
 // ===================================================================
 app.post("/analyze", upload.single("file"), async (req, res) => {
   const startTime = Date.now();
@@ -907,6 +1266,8 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
 
     console.log(`[ANALYZE] Processing ${req.file.originalname} (${(req.file.size / 1024).toFixed(1)} KB)`);
 
+    const documentId = uuidv4();
+
     const fileType = getMimeFromExt(ext);
     const analysisResult = await analyzeDocument(req.file.buffer, fileType);
     const detections = analysisResult.detections;
@@ -922,26 +1283,40 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
 
     const { score: riskScore, breakdown } = calculateRiskScore(summary, detections);
 
-    // ✅ docStats as pipeline reference (analyzer stats only fallback)
+    // docStats
     const docStats = await safeExtractDocStats(req.file.buffer, ext);
     const documentStats =
       docStats && (docStats.pages || docStats.slides || docStats.sheets || docStats.tables)
         ? docStats
         : analysisResult.documentStats || docStats;
 
-    // ✅ NEW: universal riskObjects + executive summary
+    // Universal risk model (kept)
     const riskObjects = mapDetectionsToRiskObjects(ext, detections || {});
     const riskSummary = summarizeRiskObjects(riskObjects);
 
+    // NEW: Business signals feeding Qualion Part 2
+    const businessSignals = deriveBusinessSignals(ext, detections || {});
+
+    // NEW: Qualion Part 1 + Part 2 report
+    const qualionReport = buildQualionReport({
+      documentId,
+      fileName: req.file.originalname,
+      ext,
+      detections,
+      riskObjects,
+      riskSummary,
+      businessSignals,
+    });
+
     res.json({
-      documentId: uuidv4(),
+      documentId,
       fileName: req.file.originalname,
       fileType: ext,
       fileSize: req.file.size,
 
       documentStats,
 
-      // ✅ keep current detections structure (front compatibility)
+      // keep current detections structure
       detections: {
         metadata: detections.metadata || [],
         comments: detections.comments || [],
@@ -961,7 +1336,7 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
         excelHiddenData: detections.excelHiddenData || [],
       },
 
-      // ✅ keep legacy summary shape
+      // keep legacy summary shape
       summary: {
         ...summary,
         riskScore,
@@ -970,9 +1345,13 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
         recommendations: generateRecommendations(detections),
       },
 
-      // ✅ NEW OUTPUT (non-breaking additions)
+      // kept outputs
       riskObjects,
       riskSummary,
+
+      // NEW outputs for Qualion V1
+      businessSignals,
+      qualionReport,
 
       processingTime: Date.now() - startTime,
     });
@@ -983,8 +1362,7 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
 });
 
 // ===================================================================
-// POST /clean - VERSION 3.1.0
-// ✅ Selective mode triggers ONLY when list is NON-EMPTY
+// POST /clean - VERSION 3.2.0 (same behavior, now also includes qualionReport in report payload)
 // ===================================================================
 app.post("/clean", upload.any(), async (req, res) => {
   try {
@@ -1033,10 +1411,8 @@ app.post("/clean", upload.any(), async (req, res) => {
 
       console.log(`[CLEAN] Processing ${f.originalname} with options:`, cleaningOptions);
 
-      // BEFORE stats
       const documentStatsBefore = await safeExtractDocStats(f.buffer, ext);
 
-      // analysis (optional)
       let analysisResult = null;
       let spellingErrors = [];
       let beforeRiskScore = 100;
@@ -1044,9 +1420,11 @@ app.post("/clean", upload.any(), async (req, res) => {
       let detections = null;
       let summary = null;
 
-      // ✅ NEW: universal riskObjects/riskSummary kept for report
+      // universal + business additions for report
       let riskObjects = [];
       let riskSummary = null;
+      let businessSignals = [];
+      let qualionReport = null;
 
       try {
         const fileType = getMimeFromExt(ext);
@@ -1068,9 +1446,19 @@ app.post("/clean", upload.any(), async (req, res) => {
 
         spellingErrors = detections.spellingErrors || [];
 
-        // ✅ NEW: universal mapping
         riskObjects = mapDetectionsToRiskObjects(ext, detections || {});
         riskSummary = summarizeRiskObjects(riskObjects);
+
+        businessSignals = deriveBusinessSignals(ext, detections || {});
+        qualionReport = buildQualionReport({
+          documentId: uuidv4(),
+          fileName: f.originalname,
+          ext,
+          detections,
+          riskObjects,
+          riskSummary,
+          businessSignals,
+        });
 
         analysisResult = {
           detections,
@@ -1082,13 +1470,11 @@ app.post("/clean", upload.any(), async (req, res) => {
             riskBreakdown,
             riskLevel: getRiskLevel(beforeRiskScore),
             recommendations: generateRecommendations(detections),
-
-            // ✅ include in report analysis summary
             riskSummary,
           },
-
-          // ✅ include in report analysis payload
           riskObjects,
+          businessSignals,
+          qualionReport,
         };
       } catch (analysisError) {
         console.warn(`[CLEAN] Analysis failed, continuing without:`, analysisError?.message || analysisError);
@@ -1352,7 +1738,7 @@ app.post("/clean", upload.any(), async (req, res) => {
         continue;
       }
 
-      // ---------------- Other ----------------
+      // Other
       zip.addFile(outName(single, base, f.originalname), f.buffer);
 
       addReportsToZip(zip, single, base, {
@@ -1381,7 +1767,7 @@ app.post("/clean", upload.any(), async (req, res) => {
 });
 
 // ===================================================================
-// POST /rephrase - VERSION 3.1.0
+// POST /rephrase - VERSION 3.2.0 (unchanged behavior, enriched report payload)
 // ===================================================================
 app.post("/rephrase", upload.any(), async (req, res) => {
   try {
@@ -1405,9 +1791,10 @@ app.post("/rephrase", upload.any(), async (req, res) => {
       let detections = null;
       let summary = null;
 
-      // ✅ NEW: risk objects for report
       let riskObjects = [];
       let riskSummary = null;
+      let businessSignals = [];
+      let qualionReport = null;
 
       try {
         const fileType = getMimeFromExt(ext);
@@ -1429,9 +1816,19 @@ app.post("/rephrase", upload.any(), async (req, res) => {
 
         spellingErrors = detections.spellingErrors || [];
 
-        // ✅ NEW
         riskObjects = mapDetectionsToRiskObjects(ext, detections || {});
         riskSummary = summarizeRiskObjects(riskObjects);
+
+        businessSignals = deriveBusinessSignals(ext, detections || {});
+        qualionReport = buildQualionReport({
+          documentId: uuidv4(),
+          fileName: f.originalname,
+          ext,
+          detections,
+          riskObjects,
+          riskSummary,
+          businessSignals,
+        });
 
         analysisResult = {
           detections,
@@ -1446,6 +1843,8 @@ app.post("/rephrase", upload.any(), async (req, res) => {
             riskSummary,
           },
           riskObjects,
+          businessSignals,
+          qualionReport,
         };
       } catch (analysisError) {
         console.warn(`[REPHRASE] Analysis failed:`, analysisError?.message || analysisError);
@@ -1527,7 +1926,7 @@ app.post("/rephrase", upload.any(), async (req, res) => {
 // ---------- Boot ----------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`✅ Qualion-Doc Backend v3.1.0 listening on port ${PORT}`);
+  console.log(`✅ Qualion-Doc Backend v3.2.0 listening on port ${PORT}`);
   console.log(`   Endpoints: GET /health, POST /analyze, POST /clean, POST /rephrase`);
-  console.log(`   Features: universal riskObjects + client-ready gate + selective(non-empty)`);
+  console.log(`   Features: qualionReport(part1+part2) + 5 business risk categories`);
 });
