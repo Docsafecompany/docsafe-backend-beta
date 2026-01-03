@@ -1,9 +1,10 @@
-// server.js - VERSION 3.3.0
+// server.js - VERSION 3.3.1
 // ✅ Qualion Clean V1 aligned (SINGLE SOURCE OF TRUTH)
 // ✅ Adds Part 2: Business Risk (5 categories) with deterministic flags
 // ✅ Keeps existing detections/summary/riskObjects/riskSummary (non-breaking)
 // ✅ Adds executive scoring (25/25/25/25) + critical gate + override-ready payload
 // ✅ No AI guessing. No semantic interpretation. No legal advice.
+// ✅ NEW (3.3.1): PPTX package repair always runs (rels + [Content_Types].xml) to prevent PPTX corruption
 
 import express from "express";
 import cors from "cors";
@@ -221,11 +222,7 @@ const QUALION_V1 = {
         "Fixed price without boundaries",
         "Deadlines without dependencies",
       ],
-      businessValue: [
-        "Prevent scope creep",
-        "Protect delivery margins",
-        "Align sales promises with execution reality",
-      ],
+      businessValue: ["Prevent scope creep", "Protect delivery margins", "Align sales promises with execution reality"],
     },
     negotiation: {
       title: "Negotiation Power Leakage",
@@ -705,7 +702,12 @@ async function buildBusinessRiskFlags({ ext, buffer, analysisResult, detections 
   const emailHits = countHits(text, RULES.compliance.emailLike, 30);
 
   if (complianceDetected || piiDetected || confHits > 0 || codeHits > 0 || emailHits > 0) {
-    const level = complianceDetected || piiDetected ? BIZ_SEVERITY.CRITICAL : (confHits + codeHits + emailHits >= 5 ? BIZ_SEVERITY.HIGH : BIZ_SEVERITY.MEDIUM);
+    const level =
+      complianceDetected || piiDetected
+        ? BIZ_SEVERITY.CRITICAL
+        : confHits + codeHits + emailHits >= 5
+        ? BIZ_SEVERITY.HIGH
+        : BIZ_SEVERITY.MEDIUM;
 
     flags.push(
       makeBizFlag({
@@ -738,7 +740,7 @@ async function buildBusinessRiskFlags({ ext, buffer, analysisResult, detections 
   const credTotal = comments + track + spell + orphan + hiddenStruct;
   if (credTotal > 0) {
     const level =
-      (comments + track) > 0
+      comments + track > 0
         ? BIZ_SEVERITY.HIGH
         : credTotal >= 8
         ? BIZ_SEVERITY.MEDIUM
@@ -751,8 +753,17 @@ async function buildBusinessRiskFlags({ ext, buffer, analysisResult, detections 
         ruleId: "CREDIBILITY_DRAFT_ARTIFACTS",
         reason: "Internal draft artifacts detected that may impact professional credibility.",
         location: "Document",
-        evidence: { comments, trackChanges: track, spelling: spell, formattingArtifacts: orphan, hiddenStructural: hiddenStruct },
-        source: { group: "detections", signals: ["comments", "trackChanges", "spellingErrors", "orphanData", "hiddenContent/hiddenSheets"] },
+        evidence: {
+          comments,
+          trackChanges: track,
+          spelling: spell,
+          formattingArtifacts: orphan,
+          hiddenStructural: hiddenStruct,
+        },
+        source: {
+          group: "detections",
+          signals: ["comments", "trackChanges", "spellingErrors", "orphanData", "hiddenContent/hiddenSheets"],
+        },
       })
     );
   }
@@ -798,11 +809,10 @@ function summarizeBusinessRisk(flags) {
   // Client-ready logic (per spec):
   // - Any CRITICAL signal => NO
   // - Otherwise if any category is HIGH => NO
-  const anyCritical = flags.some((f) => String(f.level).toLowerCase() === "critical");
-  const anyHigh =
-    ["margin", "delivery", "negotiation", "compliance", "credibility"].some(
-      (k) => String(byCat[k].level || "").toLowerCase() === "high"
-    );
+  const anyCritical = (flags || []).some((f) => String(f.level).toLowerCase() === "critical");
+  const anyHigh = ["margin", "delivery", "negotiation", "compliance", "credibility"].some(
+    (k) => String(byCat[k].level || "").toLowerCase() === "high"
+  );
 
   const clientReady = anyCritical || anyHigh ? "NO" : "YES";
 
@@ -841,7 +851,6 @@ function summarizeBusinessRisk(flags) {
 
 // Build Qualion Clean V1 report payload (Part1 + Part2)
 function buildQualionCleanV1Report({ documentId, fileName, ext, detections, businessFlags, businessSummary }) {
-  // Part 1 already exists in your UI; we still provide a clean structure to support new site update
   const part1 = {
     title: "Technical & Content Hygiene Report",
     defaultView: true,
@@ -947,7 +956,6 @@ function buildQualionCleanV1Report({ documentId, fileName, ext, detections, busi
     fileTypeContext: QUALION_V1.fileTypeFeatures[ext] || null,
     part1,
     part2,
-    // For debug or analytics (front can ignore)
     internal: {
       businessFlagsCount: businessFlags.length,
     },
@@ -1098,7 +1106,7 @@ app.get("/health", (_, res) =>
   res.json({
     ok: true,
     service: "Qualion-Doc Backend",
-    version: "3.3.0",
+    version: "3.3.1",
     endpoints: ["/analyze", "/clean", "/rephrase"],
     features: [
       "qualion-clean-v1-part2-business-risk",
@@ -1107,13 +1115,14 @@ app.get("/health", (_, res) =>
       "override-ready-payload",
       "no-ai-guessing",
       "non-breaking-output",
+      "pptx-package-repair-always",
     ],
     time: new Date().toISOString(),
   })
 );
 
 // ===================================================================
-// POST /analyze - VERSION 3.3.0
+// POST /analyze - VERSION 3.3.1
 // ===================================================================
 app.post("/analyze", upload.single("file"), async (req, res) => {
   const startTime = Date.now();
@@ -1228,7 +1237,7 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
 });
 
 // ===================================================================
-// POST /clean - VERSION 3.3.0
+// POST /clean - VERSION 3.3.1
 // (unchanged behavior, but still returns report.zip with analysis payload inside report.json)
 // ===================================================================
 app.post("/clean", upload.any(), async (req, res) => {
@@ -1248,6 +1257,9 @@ app.post("/clean", upload.any(), async (req, res) => {
       removeEmbeddedObjects: req.body.removeEmbeddedObjects !== "false",
       removeMacros: req.body.removeMacros !== "false",
       correctSpelling: req.body.correctSpelling !== "false",
+
+      // ✅ NEW: always repair PPTX package validity (rels + [Content_Types].xml) to avoid corruption
+      repairPptxPackage: req.body.repairPptxPackage !== "false",
     };
 
     const approvedSpellingErrors = safeJsonArray(req.body.approvedSpellingErrors, []);
@@ -1458,13 +1470,22 @@ app.post("/clean", upload.any(), async (req, res) => {
           currentBuffer = visualResult.outBuffer;
         }
 
+        // ✅ CRITICAL FIX:
+        // Always run correctPPTXText at least once to repair PPTX package integrity
+        // (cleans orphaned .rels + [Content_Types].xml) to prevent PowerPoint "repair" / corruption.
         let correctionStats = null;
-        if (cleaningOptions.correctSpelling) {
+        const shouldRepairPackage = cleaningOptions.repairPptxPackage !== false;
+
+        if (shouldRepairPackage || cleaningOptions.correctSpelling) {
           const corrected = await correctPPTXText(currentBuffer, aiCorrectText, {
-            spellingErrors: spellingFixList,
+            // If spelling is OFF -> empty list (repair only)
+            spellingErrors: cleaningOptions.correctSpelling ? spellingFixList : [],
           });
+
           currentBuffer = corrected.outBuffer;
-          correctionStats = corrected.stats;
+
+          // Only report correction stats when spelling was enabled
+          correctionStats = cleaningOptions.correctSpelling ? corrected.stats : null;
         }
 
         const documentStatsAfter = await safeExtractDocStats(currentBuffer, ext);
@@ -1622,7 +1643,7 @@ app.post("/clean", upload.any(), async (req, res) => {
 });
 
 // ===================================================================
-// POST /rephrase - VERSION 3.3.0
+// POST /rephrase - VERSION 3.3.1
 // ===================================================================
 app.post("/rephrase", upload.any(), async (req, res) => {
   try {
@@ -1782,7 +1803,8 @@ app.post("/rephrase", upload.any(), async (req, res) => {
 // ---------- Boot ----------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`✅ Qualion-Doc Backend v3.3.0 listening on port ${PORT}`);
+  console.log(`✅ Qualion-Doc Backend v3.3.1 listening on port ${PORT}`);
   console.log(`   Endpoints: GET /health, POST /analyze, POST /clean, POST /rephrase`);
   console.log(`   Features: Qualion Clean V1 Part2 (Business Risk 5 cats + executive scoring + override payload)`);
+  console.log(`   PPTX: package integrity repair always enabled (rels + [Content_Types].xml)`);
 });
